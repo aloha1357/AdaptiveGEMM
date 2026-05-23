@@ -31,12 +31,18 @@ set(ADAPTIVEGEMM_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "Path to the standa
 set(ADAPTIVEGEMM_CU "${ADAPTIVEGEMM_ROOT}/src/AdaptiveOzaki.cu")
 set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
 
+if(MSVC)
+    set(NVCC_MSVC_FLAGS "-Xcompiler=/MD")
+else()
+    set(NVCC_MSVC_FLAGS "")
+endif()
+
 add_custom_command(
     OUTPUT "${ADAPTIVEGEMM_OBJ}"
     COMMAND ${NVCC_EXECUTABLE}
         --std=c++17
         -arch=sm_89
-        -Xcompiler=/MD
+        ${NVCC_MSVC_FLAGS}
         -I
         ${ADAPTIVEGEMM_ROOT}/include
         -I
