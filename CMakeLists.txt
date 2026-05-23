@@ -62,6 +62,7 @@ add_library(adaptive_gemm STATIC
 
 set_target_properties(adaptive_gemm PROPERTIES
     LINKER_LANGUAGE CXX
+    POSITION_INDEPENDENT_CODE ON
 )
 
 target_include_directories(adaptive_gemm
