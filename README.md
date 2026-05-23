@@ -162,4 +162,4 @@ This repository view is intentionally narrow.
 
 - It keeps the technical narrative focused on GEMM, not on every experimental phase.
 - It preserves the exact story reviewers need: pain point, method, profiling evidence, and application path.
-- It leaves space for you to replace placeholder metrics with final NCU evidence before publishing.
+- It leaves space for you to replace placeholder metrics with final NCU evidence before publishing. 
