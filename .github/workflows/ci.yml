@@ -19,10 +19,11 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++ git python3-dev python3-pip
-          pip3 install pytest numpy --break-system-packages
+          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++ git python3-dev python3-pip python3-venv
+          python3 -m venv venv
+          ./venv/bin/pip install pytest numpy
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=${{ github.workspace }}/venv/bin/python
       - name: Build
         run: cmake --build build --target adaptive_gemm_demo adaptive_gemm_precision_test adaptive_gemm_py
 
@@ -33,9 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python dependencies
-        run: pip3 install pytest numpy --break-system-packages
+        run: |
+          python3 -m venv venv
+          ./venv/bin/pip install pytest numpy
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=${{ github.workspace }}/venv/bin/python
       - name: Build
         run: cmake --build build
       - name: Precision test
