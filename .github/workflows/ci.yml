@@ -19,7 +19,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++
+          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++ git
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
