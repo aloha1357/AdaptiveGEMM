@@ -23,7 +23,7 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install pytest numpy
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=${{ github.workspace }}/venv/bin/python
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=$PWD/venv/bin/python
       - name: Build
         run: cmake --build build --target adaptive_gemm_demo adaptive_gemm_precision_test adaptive_gemm_py
 
@@ -38,7 +38,7 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install pytest numpy
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=${{ github.workspace }}/venv/bin/python
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=$PWD/venv/bin/python
       - name: Build
         run: cmake --build build
       - name: Precision test
