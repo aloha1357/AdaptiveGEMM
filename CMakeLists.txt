@@ -32,9 +32,9 @@ set(ADAPTIVEGEMM_CU "${ADAPTIVEGEMM_ROOT}/src/AdaptiveOzaki.cu")
 set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
 
 if(MSVC)
-    set(NVCC_MSVC_FLAGS "-Xcompiler=/MD")
+    set(NVCC_EXTRA_FLAGS "-Xcompiler=/MD")
 else()
-    set(NVCC_MSVC_FLAGS "")
+    set(NVCC_EXTRA_FLAGS "-Xcompiler=-fPIC")
 endif()
 
 add_custom_command(
@@ -42,7 +42,7 @@ add_custom_command(
     COMMAND ${NVCC_EXECUTABLE}
         --std=c++17
         -arch=sm_89
-        ${NVCC_MSVC_FLAGS}
+        ${NVCC_EXTRA_FLAGS}
         -I
         ${ADAPTIVEGEMM_ROOT}/include
         -I
