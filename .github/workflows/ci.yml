@@ -23,7 +23,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --target adaptive_gemm_demo adaptive_gemm_precision_test -- -j
+        run: cmake --build build --target adaptive_gemm_demo adaptive_gemm_precision_test
 
   gpu-validate:
     name: GPU precision test (self-hosted)
