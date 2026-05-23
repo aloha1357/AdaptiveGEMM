@@ -119,28 +119,28 @@ Apache 2.0 already allows academic, personal, and commercial use. If you want to
 ### Build
 
 ```bash
-cmake -S public_release -B public_release/build -DCMAKE_BUILD_TYPE=Release
-cmake --build public_release/build --config Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
 
 ### Run demo
 
 ```bash
-./public_release/build/Release/adaptive_gemm_demo
+./build/Release/adaptive_gemm_demo
 ```
 
-For Windows with Visual Studio generators, open `public_release/` as the build root in VS Code or use the generated `public_release/build` directory directly.
+For Windows with Visual Studio generators, open the root directory (`.`) as the build root in VS Code or use the generated `build` directory directly.
 
 ### Run precision test
 
 ```bash
-ctest --test-dir public_release/build -C Release --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 ## Repository Layout
 
 ```text
-public_release/
+.
 ├── .github/
 │   └── workflows/
 ├── include/

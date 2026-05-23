@@ -45,7 +45,7 @@ add_custom_command(
         ${ADAPTIVEGEMM_CU}
         -o
         ${ADAPTIVEGEMM_OBJ}
-    DEPENDS "${ADAPTIVEOZAKI_CU}"
+    DEPENDS "${ADAPTIVEGEMM_CU}"
     COMMENT "Compiling AdaptiveOzaki.cu with nvcc"
     VERBATIM
 )
@@ -54,7 +54,7 @@ add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
 )
 
-set_target_properties(adaptive_ozaki PROPERTIES
+set_target_properties(adaptive_gemm PROPERTIES
     LINKER_LANGUAGE CXX
 )
 
