@@ -6,7 +6,7 @@ if(NOT DEFINED CUDAToolkit_ROOT AND DEFINED ENV{CUDA_PATH})
     set(CUDAToolkit_ROOT "$ENV{CUDA_PATH}")
 endif()
 
-project(AdaptiveOzakiPublic LANGUAGES CXX)
+project(AdaptiveGEMM LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,71 +26,71 @@ endif()
 
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_INCLUDE_DIR)
 
-set(ADAPTIVEOZAKI_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "Path to the standalone public release source tree")
+set(ADAPTIVEGEMM_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "Path to the standalone public release source tree")
 
-set(ADAPTIVEOZAKI_CU "${ADAPTIVEOZAKI_ROOT}/src/AdaptiveOzaki.cu")
-set(ADAPTIVEOZAKI_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
+set(ADAPTIVEGEMM_CU "${ADAPTIVEGEMM_ROOT}/src/AdaptiveOzaki.cu")
+set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
 
 add_custom_command(
-    OUTPUT "${ADAPTIVEOZAKI_OBJ}"
+    OUTPUT "${ADAPTIVEGEMM_OBJ}"
     COMMAND ${NVCC_EXECUTABLE}
         --std=c++17
         -arch=sm_89
         -Xcompiler=/MD
         -I
-        ${ADAPTIVEOZAKI_ROOT}/include
+        ${ADAPTIVEGEMM_ROOT}/include
         -I
         ${CUDA_INCLUDE_DIR}
         -c
-        ${ADAPTIVEOZAKI_CU}
+        ${ADAPTIVEGEMM_CU}
         -o
-        ${ADAPTIVEOZAKI_OBJ}
+        ${ADAPTIVEGEMM_OBJ}
     DEPENDS "${ADAPTIVEOZAKI_CU}"
     COMMENT "Compiling AdaptiveOzaki.cu with nvcc"
     VERBATIM
 )
 
-add_library(adaptive_ozaki STATIC
-    "${ADAPTIVEOZAKI_OBJ}"
+add_library(adaptive_gemm STATIC
+    "${ADAPTIVEGEMM_OBJ}"
 )
 
 set_target_properties(adaptive_ozaki PROPERTIES
     LINKER_LANGUAGE CXX
 )
 
-target_include_directories(adaptive_ozaki
+target_include_directories(adaptive_gemm
     PUBLIC
-    "${ADAPTIVEOZAKI_ROOT}/include"
+    "${ADAPTIVEGEMM_ROOT}/include"
 )
 
-target_link_libraries(adaptive_ozaki
+target_link_libraries(adaptive_gemm
     PUBLIC
         CUDA::cublas
         CUDA::cudart
 )
 
-add_executable(adaptive_ozaki_demo
+add_executable(adaptive_gemm_demo
     examples/demo_main.cpp
 )
 
-target_link_libraries(adaptive_ozaki_demo
+target_link_libraries(adaptive_gemm_demo
     PRIVATE
-        adaptive_ozaki
+        adaptive_gemm
         CUDA::cublas
         CUDA::cudart
 )
 
 enable_testing()
 
-add_executable(adaptive_ozaki_precision_test
+add_executable(adaptive_gemm_precision_test
     tests/precision_test.cpp
 )
 
-target_link_libraries(adaptive_ozaki_precision_test
+target_link_libraries(adaptive_gemm_precision_test
     PRIVATE
-        adaptive_ozaki
+        adaptive_gemm
         CUDA::cublas
         CUDA::cudart
 )
 
-add_test(NAME precision COMMAND adaptive_ozaki_precision_test)
+add_test(NAME precision COMMAND adaptive_gemm_precision_test)

@@ -1,4 +1,4 @@
-# AdaptiveOzaki: RTX 4060 上的 INT8 Tensor Core Ozaki Scheme FP64 加速
+# AdaptiveGEMM: RTX 4060 上的 INT8 Tensor Core Ozaki Scheme FP64 加速
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
@@ -6,7 +6,7 @@
 [![CMake](https://img.shields.io/badge/CMake-3.18%2B-064F8C.svg)](https://cmake.org/)
 [![CI](https://img.shields.io/badge/GitHub_Actions-enabled-2088FF.svg)](.github/workflows/ci.yml)
 
-AdaptiveOzaki 是一個面向 NVIDIA Ada 架構消費級 GPU 的 CUDA C++ GEMM 專案，核心目標是在 FP64 算力受限的 RTX 4060 / 4090 等卡上，透過 INT8 Tensor Core、Ozaki Scheme 與 CRT/RNS 重建，把高精度矩陣乘法推進到接近資料中心級 GPU 的效能區間。
+AdaptiveGEMM 是一個面向 NVIDIA Ada 架構消費級 GPU 的 CUDA C++ GEMM 專案，核心目標是在 FP64 算力受限的 RTX 4060 / 4090 等卡上，透過 INT8 Tensor Core、Ozaki Scheme 與 CRT/RNS 重建，把高精度矩陣乘法推進到接近資料中心級 GPU 的效能區間。
 
 這個 `public_release/` 目錄是可直接搬到 GitHub 的獨立 repo 視圖：包含授權、原始碼、示範程式、測試、GitHub Actions 與投稿摘要，不再依賴父層工程。
 
@@ -20,7 +20,7 @@ Important: this repository is open source under Apache 2.0. If you want separate
 - GPU 硬體最擅長的卻是低精度 Tensor Core。
 - 傳統 cuBLAS FP64 在消費級卡上常常被硬體規格直接卡死。
 
-AdaptiveOzaki 的切入點，就是把「高精度需求」拆成「可在 Tensor Core 上高吞吐執行的低精度子問題」，再透過 Ozaki Scheme 與重建流程把結果拉回 FP64 可接受的精度區間。
+AdaptiveGEMM 的切入點，就是把「高精度需求」拆成「可在 Tensor Core 上高吞吐執行的低精度子問題」，再透過 Ozaki Scheme 與重建流程把結果拉回 FP64 可接受的精度區間。
 
 ## Technical Highlights
 
@@ -82,7 +82,7 @@ AdaptiveOzaki 的切入點，就是把「高精度需求」拆成「可在 Tenso
 | Method | Precision | Time | Throughput | Notes |
 |---|---:|---:|---:|---|
 | cuBLAS FP64 | FP64 | TODO | TODO | baseline |
-| AdaptiveOzaki | FP64-like | TODO | TODO | INT8 Tensor Core + Ozaki |
+| AdaptiveGEMM | FP64-like | TODO | TODO | INT8 Tensor Core + Ozaki |
 
 ## Use Cases & API
 
@@ -126,7 +126,7 @@ cmake --build public_release/build --config Release
 ### Run demo
 
 ```bash
-./public_release/build/Release/adaptive_ozaki_demo
+./public_release/build/Release/adaptive_gemm_demo
 ```
 
 For Windows with Visual Studio generators, open `public_release/` as the build root in VS Code or use the generated `public_release/build` directory directly.

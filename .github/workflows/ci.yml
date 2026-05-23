@@ -1,4 +1,4 @@
-name: AdaptiveOzaki CI
+name: AdaptiveGEMM CI
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
       - name: Configure
         run: cmake -S public_release -B public_release/build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build public_release/build --target adaptive_ozaki_demo adaptive_ozaki_precision_test
+        run: cmake --build public_release/build --target adaptive_gemm_demo adaptive_gemm_precision_test
 
   gpu-validate:
     name: Run precision test on GPU runner
@@ -35,6 +35,6 @@ jobs:
       - name: Configure
         run: cmake -S public_release -B public_release/build -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build public_release/build --target adaptive_ozaki_precision_test
+        run: cmake --build public_release/build --target adaptive_gemm_precision_test
       - name: Precision test
         run: ctest --test-dir public_release/build -C Release --output-on-failure
