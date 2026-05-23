@@ -75,8 +75,29 @@ target_link_libraries(adaptive_gemm
         CUDA::cudart
 )
 
-# Optional Python binding removed for public release as it is currently experimental
-# and requires additional dependencies not present in standard CUDA CI containers.
+# Optional Python binding via pybind11
+include(FetchContent)
+FetchContent_Declare(
+    pybind11
+    GIT_REPOSITORY https://github.com/pybind/pybind11.git    
+    GIT_TAG        v2.11.1
+)
+FetchContent_MakeAvailable(pybind11)
+
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+
+pybind11_add_module(adaptive_gemm_py
+        src/pybind_module.cpp
+)
+
+target_include_directories(adaptive_gemm_py PUBLIC ${ADAPTIVEGEMM_ROOT}/include)
+
+target_link_libraries(adaptive_gemm_py PRIVATE 
+    pybind11::module
+    adaptive_gemm
+    CUDA::cublas
+    CUDA::cudart
+)
 
 add_executable(adaptive_gemm_demo
     examples/demo_main.cpp
@@ -103,3 +124,13 @@ target_link_libraries(adaptive_gemm_precision_test
 )
 
 add_test(NAME precision COMMAND adaptive_gemm_precision_test)
+
+# Add pytest for the Python binding
+add_test(NAME pytest_binding
+    COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py
+)
+
+# Ensure Python can find the built module by setting PYTHONPATH to the library output directory
+set_tests_properties(pytest_binding PROPERTIES
+    ENVIRONMENT "PYTHONPATH=$<TARGET_FILE_DIR:adaptive_gemm_py>"
+)
