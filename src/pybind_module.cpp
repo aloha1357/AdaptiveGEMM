@@ -25,7 +25,21 @@ static py::array_t<double> gemm_ref(py::array_t<double> a, py::array_t<double> b
     return c;
 }
 
+class AdaptiveGEMMWrapper {
+public:
+    AdaptiveGEMMWrapper() {}
+
+    py::array_t<double> gemm(py::array_t<double> A, py::array_t<double> B) {
+        // For now use CPU reference implementation. Future: call CUDA engine when available.
+        return gemm_ref(A, B);
+    }
+};
+
 PYBIND11_MODULE(adaptive_gemm_py, m) {
-    m.doc() = "AdaptiveGEMM Python bindings (simple CPU reference GEMM)";
+    m.doc() = "AdaptiveGEMM Python bindings (simple CPU reference GEMM and wrapper)";
     m.def("gemm_ref", &gemm_ref, "Compute reference GEMM on CPU", py::arg("A"), py::arg("B"));
+
+    py::class_<AdaptiveGEMMWrapper>(m, "AdaptiveGEMM")
+        .def(py::init<>())
+        .def("gemm", &AdaptiveGEMMWrapper::gemm, "Compute GEMM", py::arg("A"), py::arg("B"));
 }
