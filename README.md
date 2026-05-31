@@ -57,11 +57,11 @@ The kernel effectively drives heterogeneous compute pipelines, with the heavy li
 
 | Pipeline | Active Cycle Utilization | Role in AdaptiveOzaki |
 |----------|--------------------------|-----------------------|
-| **Tensor (INT8)** | **37.0%** | Primary CRT residue matrix multiplication. |
+| **Tensor (INT8)** | **36.5%** | Primary CRT residue matrix multiplication. Explicitly captured in the Tensor Core Roofline chart. |
 | **ALU / FMA** | **~25.0%** | Reconstruction math and sliding pointer logic. |
 | **FP64** | **~1.0%** | Final scaling and bias adjustment (largely bypassed). |
 
-**Roofline Status:** The kernel is currently balanced at the intersection of Memory-Bound and Compute-Bound regions. Memory throughput has reached **70.54%** of theoretical peak, while achieved occupancy has improved to **48.10%**.
+**Roofline Status:** The kernel is currently balanced at the intersection of Memory-Bound and Compute-Bound regions. Memory throughput has reached **70.54%** of theoretical peak, while achieved occupancy has improved to **48.10%**. The latest profiling includes a hierarchical Tensor Core Roofline analysis.
 
 <!-- Insert Nsight Compute screenshots below -->
 ![Speed of Light](docs/profile_sol.png)
