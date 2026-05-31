@@ -625,7 +625,7 @@ struct KernelHeteroConfig {
 
 __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, double* __restrict__ C, const uint64_t* mA, const uint64_t* mB, int m, int n, int k, double inv, KernelHeteroConfig cfg) {
     int rb = blockIdx.y * 128, cb = blockIdx.x * 64, tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
-    int wm = wid / 2, wn = wid % 2, ms = wm * 32, ns = (wid % 2) * 32; 
+    int wm = wid / 2, wn = wid % 2, ms = wm * 32, ns = (wid % 2) * 32;
     uint64_t bma = mA[blockIdx.y], bmb = mB[blockIdx.x / 2], M = 0; int nl = 0;
     int tc_begin = cfg.warp_fp64;
     int tc_end = cfg.warp_fp64 + cfg.warp_tc;
@@ -663,7 +663,7 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
         // Load sa: 128 rows x 32 cols. 256 threads * 16 bytes = 4096 bytes. (128*32 = 4096).
         int m_idx = tid / 2, k_idx = (tid % 2) * 16;
         if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][k_idx], &A8[p * mk + (size_t)(rb + m_idx) * k + k_idx]); else *(int4*)&sa[0][m_idx][k_idx] = make_int4(0, 0, 0, 0);
-        
+
         // Load sb: 64 rows x 32 cols. 128 loads of 16 bytes.
         if (tid < 128) {
             int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
@@ -753,17 +753,17 @@ __global__ __launch_bounds__(256, 2)
 void hetero_crt_pass_kernel(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, const double* __restrict__ A, const double* __restrict__ B, double* __restrict__ C, const uint64_t* mA, const uint64_t* mB, int m, int n, int k, double inv, KernelHeteroConfig cfg, int pass, int fp64_kernel, int split_bits) {
     crt_pass_kernel_body(A8, B8, C, mA, mB, m, n, k, inv, cfg);
     if (fp64_kernel && pass == 0) {
-        int rb = blockIdx.y * 128, cb = blockIdx.x * 128;
+        int rb = blockIdx.y * 128, cb = blockIdx.x * 64; // Note cb is * 64 now (since C tile is 128x64) Wait! In hetero_crt_pass_kernel it was cb = blockIdx.x * 128. Let me fix the grid.
         int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
-        int wm = wid / 2, wn = wid % 2, ms = wm * 32, ns = wn * 64;        
+        int wm = wid / 2, wn = wid % 2, ms = wm * 16, ns = wn * 32;        
         // Only let the designated fp64 warps perform FP64 hi*hi accumulation
         bool fp64_active = (cfg.warp_fp64 > 0) ? (wid >= 0 && wid < cfg.warp_fp64) : true;
         if (fp64_active) {
             // Each lane computes its own outputs and writes them directly.
-            int row = rb + ms + lane;
+            int row = rb + ms + lane % 16;
             double sum0 = 0.0, sum1 = 0.0;
             if (row < m) {
-                int col0 = cb + ns + (lane * 2);
+                int col0 = cb + ns + (lane / 16) * 16 + (lane % 8) * 2;
                 int col1 = col0 + 1;
                 for (int kk = 0; kk < k; ++kk) {
                     double a_hi = fp64_hi(A[(size_t)row * k + kk], split_bits);
@@ -887,7 +887,7 @@ __global__ void hybrid_ozaki_persistent_kernel(
                     sA8[p * 4096 + b_idx * 2048 + r * 32 + c] = val;
                 }
                 for (int i = threadIdx.x; i < k_size * 64; i += 256) {
-                    int r = i / 64, c = i % 64;
+                    int c = i / k_size, r = i % k_size;
                     int8_t val = (kk + r < k && tile_n + c < n) ? Bp[(size_t)(tile_n + c) * k + (kk + r)] : 0;
                     sB8[p * 4096 + b_idx * 2048 + r * 64 + c] = val;
                 }
