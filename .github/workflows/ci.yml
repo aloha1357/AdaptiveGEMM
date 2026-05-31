@@ -5,13 +5,12 @@ on:
     branches:
       - public-release
       - main
-      - master
   pull_request:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build on CUDA container
+    name: Build and precision test (container)
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.6.2-devel-ubuntu22.04
@@ -20,21 +19,21 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++
+          DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build g++ git python3-dev
       - name: Configure
-        run: cmake -S public_release -B public_release/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build public_release/build --target adaptive_gemm_demo adaptive_gemm_precision_test
+        run: cmake --build build --target adaptive_gemm_demo adaptive_gemm_precision_test
 
   gpu-validate:
-    name: Run precision test on GPU runner
+    name: GPU precision test (self-hosted)
     needs: build
     runs-on: [self-hosted, linux, gpu]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S public_release -B public_release/build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build public_release/build --target adaptive_gemm_precision_test
+        run: cmake --build build --target adaptive_gemm_precision_test
       - name: Precision test
-        run: ctest --test-dir public_release/build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure

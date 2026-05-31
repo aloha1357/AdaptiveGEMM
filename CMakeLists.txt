@@ -31,12 +31,18 @@ set(ADAPTIVEGEMM_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "Path to the standa
 set(ADAPTIVEGEMM_CU "${ADAPTIVEGEMM_ROOT}/src/AdaptiveOzaki.cu")
 set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
 
+if(MSVC)
+    set(NVCC_MSVC_FLAGS "-Xcompiler=/MD")
+else()
+    set(NVCC_MSVC_FLAGS "")
+endif()
+
 add_custom_command(
     OUTPUT "${ADAPTIVEGEMM_OBJ}"
     COMMAND ${NVCC_EXECUTABLE}
         --std=c++17
         -arch=sm_89
-        -Xcompiler=/MD
+        ${NVCC_MSVC_FLAGS}
         -I
         ${ADAPTIVEGEMM_ROOT}/include
         -I
@@ -45,7 +51,7 @@ add_custom_command(
         ${ADAPTIVEGEMM_CU}
         -o
         ${ADAPTIVEGEMM_OBJ}
-    DEPENDS "${ADAPTIVEOZAKI_CU}"
+    DEPENDS "${ADAPTIVEGEMM_CU}"
     COMMENT "Compiling AdaptiveOzaki.cu with nvcc"
     VERBATIM
 )
@@ -54,7 +60,7 @@ add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
 )
 
-set_target_properties(adaptive_ozaki PROPERTIES
+set_target_properties(adaptive_gemm PROPERTIES
     LINKER_LANGUAGE CXX
 )
 
@@ -68,6 +74,9 @@ target_link_libraries(adaptive_gemm
         CUDA::cublas
         CUDA::cudart
 )
+
+# Optional Python binding removed for public release as it is currently experimental
+# and requires additional dependencies not present in standard CUDA CI containers.
 
 add_executable(adaptive_gemm_demo
     examples/demo_main.cpp

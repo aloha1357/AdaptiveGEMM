@@ -1,0 +1,17 @@
+name: GPU Runner Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    name: Verify GPU Runner Configuration
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check NVIDIA SMI
+        run: nvidia-smi
+      - name: Check NVCC Compiler
+        run: nvcc --version || true
+      - name: System Info
+        run: uname -a
