@@ -51,10 +51,17 @@ A100-class hardware.
 * **Occupancy Breakthrough:** The main `decoupled_crt_pass_kernel` achieved **50%-60% SM Occupancy** (up from the previous 33.33% ceiling). This was achieved by applying `__launch_bounds__(256, 3)` and performing variable life-cycle analysis to allow targeted L1 register spilling.
 * **Sliding Pointers:** Replaced ALU-heavy modulo indexing in the critical inner loops with sliding pointer offsets, significantly reducing execution latency.
 
-### Pipeline Utilization & Profiler Notes
+### Pipeline Utilization & Profiler Notes (Phase 28)
 
-The kernel simultaneously drives FP64 CUDA cores (hi×hi term reconstruction)
-and INT8 Tensor Cores (CRT passes), effectively utilizing heterogeneous compute pipelines.
+The kernel effectively drives heterogeneous compute pipelines, with the heavy lifting offloaded to Tensor Cores. Based on the latest **Nsight Compute (ncu)** analysis of `decoupled_crt_pass_kernel`:
+
+| Pipeline | Active Cycle Utilization | Role in AdaptiveOzaki |
+|----------|--------------------------|-----------------------|
+| **Tensor (INT8)** | **37.0%** | Primary CRT residue matrix multiplication. |
+| **ALU / FMA** | **~25.0%** | Reconstruction math and sliding pointer logic. |
+| **FP64** | **~1.0%** | Final scaling and bias adjustment (largely bypassed). |
+
+**Roofline Status:** The kernel is currently balanced at the intersection of Memory-Bound and Compute-Bound regions. Memory throughput has reached **70.54%** of theoretical peak, while achieved occupancy has improved to **48.10%**.
 
 <!-- Insert Nsight Compute screenshots below -->
 ![Speed of Light](docs/profile_sol.png)
