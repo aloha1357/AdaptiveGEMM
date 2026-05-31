@@ -24,6 +24,24 @@ __device__ __forceinline__ double pow2_int(int exp) {
     return ldexp(1.0, exp);
 }
 
+__device__ __forceinline__ size_t get_A8_offset(int m_idx, int k_idx, int m, int k) {
+    int tile_m = m_idx >> 7;
+    int tile_k = k_idx >> 5;
+    int local_m = m_idx & 127;
+    int local_k = k_idx & 31;
+    int num_tiles_k = (k + 31) >> 5;
+    return (size_t)(tile_m * num_tiles_k + tile_k) * 4096 + (local_m << 5) + local_k;
+}
+
+__device__ __forceinline__ size_t get_B8_offset(int n_idx, int k_idx, int n, int k) {
+    int tile_n = n_idx >> 6;
+    int tile_k = k_idx >> 5;
+    int local_n = n_idx & 63;
+    int local_k = k_idx & 31;
+    int num_tiles_k = (k + 31) >> 5;
+    return (size_t)(tile_n * num_tiles_k + tile_k) * 2048 + (local_n << 5) + local_k;
+}
+
 __device__ __forceinline__ double fp64_hi(double v, int split_bits) {      
     double scale = pow2_int(split_bits);
     double scaled = v * scale;
@@ -45,16 +63,34 @@ __device__ __forceinline__ void mma_m16n8k32_s8(
 
 namespace ozaki {
 
-AdaptiveOzakiEngine::AdaptiveOzakiEngine(const OzakiConfig& config) : config_(config) {}
-AdaptiveOzakiEngine::~AdaptiveOzakiEngine() { freeWorkspace(); }
+__device__ __forceinline__ void ldmatrix_x4_int8(uint32_t* d, void* smem_ptr) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(smem_addr));
+}
+
+__device__ __forceinline__ void ldmatrix_x2_int8(uint32_t* d, void* smem_ptr) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+        : "=r"(d[0]), "=r"(d[1]) : "r"(smem_addr));
+}
+
+AdaptiveOzakiEngine::AdaptiveOzakiEngine(const OzakiConfig& config) : config_(config) {
+}
+AdaptiveOzakiEngine::~AdaptiveOzakiEngine() { 
+    freeWorkspace(); 
+}
 
 void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     if (workspace_allocated_) freeWorkspace();
     int nm = (m + 127) / 128, nn = (n + 127) / 128;
     cudaMalloc(&dmA_h, nm * 8); cudaMalloc(&dmA_l, nm * 8);
     cudaMalloc(&dmB_h, nn * 8); cudaMalloc(&dmB_l, nn * 8);
-    cudaMalloc(&dA8_h, 7ULL * m * k); cudaMalloc(&dA8_l, 7ULL * m * k);
-    cudaMalloc(&dB8_h, 7ULL * k * n); cudaMalloc(&dB8_l, 7ULL * k * n);
+    
+    size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
+    size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
+    cudaMalloc(&dA8_h, 7ULL * padded_mk); cudaMalloc(&dA8_l, 7ULL * padded_mk);
+    cudaMalloc(&dB8_h, 7ULL * padded_kn); cudaMalloc(&dB8_l, 7ULL * padded_kn);
     
     size_t mk = (size_t)m * k;
     size_t kn = (size_t)k * n;
@@ -80,84 +116,70 @@ PreScanStats AdaptiveOzakiEngine::analyzeMatrix(const double* d_A, const double*
 int AdaptiveOzakiEngine::calculateOptimalTile(int m, int n, int k) { return 128; }
 
 __global__ void precompute_modulo_kernel(const double* __restrict__ s, int8_t* __restrict__ d, int r, int c, int m, double sh, double sl) {
-    int row = blockIdx.y * 16 + threadIdx.y;
-    int col = (blockIdx.x * 16 + threadIdx.x) * 2;
+    // blockIdx.x: k_tiles, blockIdx.y: m_tiles. Block size: (32, 32)
+    int local_k = threadIdx.x; // 0..31
+    int local_m = threadIdx.y; // 0..31
+    int tile_k = blockIdx.x;
+    int tile_m = blockIdx.y;
+
     const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
-    if (row < r && col + 1 < c) {
-        double2 v2 = *(const double2*)&s[(size_t)row * c + col];
-        int32_t iv[2] = {0, 0};
+    size_t padded_size = (size_t)((r + 127) / 128) * ((c + 31) / 32) * 4096;
+    int num_tiles_k = (c + 31) / 32;
+
+    // A block (32x32) processes a 32x32 sub-tile of a 128x32 tile.
+    // There are 4 such sub-tiles in a 128x32 tile vertically.
+    // We can just launch more blocks or loop.
+    // Let's launch with grid (num_tiles_k, num_tiles_m * 4).
+    int m_idx = (tile_m / 4) * 128 + (tile_m % 4) * 32 + local_m;
+    int k_idx = tile_k * 32 + local_k;
+
+    if (m_idx < r && k_idx < c) {
+        double v = s[(size_t)m_idx * c + k_idx];
+        int32_t iv = 0;
+        if (v != 0.0) {
+            if (m == 0) iv = __double2int_rn(v * sh);
+            else iv = __double2int_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl);
+        }
         
-        #pragma unroll
-        for(int i = 0; i < 2; i++) {
-            double v = (i == 0) ? v2.x : v2.y;
-            if (v != 0.0) { 
-                if (m == 0) iv[i] = __double2int_rn(v * sh); 
-                else iv[i] = __double2int_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl); 
-            }
-        }
-        for (int p = 0; p < 7; p++) { 
-            int16_t rem_packed = 0;
-            #pragma unroll
-            for(int i = 0; i < 2; i++) {
-                int16_t rem = iv[i] % pr[p]; 
-                if (rem < 0) rem += pr[p]; 
-                rem_packed |= ((rem & 0xFF) << (i * 8));
-            }
-            *(int16_t*)&d[p * ((size_t)r * c) + (size_t)row * c + col] = rem_packed;
-        }
-    } else if (row < r && col < c) {
-        for(int i = 0; i < 2 && col + i < c; i++) {
-            double v = s[(size_t)row * c + col + i]; 
-            int64_t iv = 0;
-            if (v != 0.0) { 
-                if (m == 0) iv = __double2ll_rn(v * sh); 
-                else iv = __double2ll_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl); 
-            }
-            for (int p = 0; p < 7; p++) { 
-                int32_t rem = iv % pr[p]; 
-                if (rem < 0) rem += pr[p]; 
-                d[p * ((size_t)r * c) + (size_t)row * c + col + i] = (int8_t)rem; 
-            }
+        size_t out_off = (size_t)( (m_idx / 128) * num_tiles_k + tile_k ) * 4096 + (m_idx % 128) * 32 + local_k;
+        for (int p = 0; p < 7; p++) {
+            int32_t rem = iv % pr[p];
+            if (rem < 0) rem += pr[p];
+            d[p * padded_size + out_off] = (int8_t)rem;
         }
     }
 }
 __global__ void precompute_modulo_kernel_B(const double* __restrict__ s, int8_t* __restrict__ d, int r, int c, int m, double sh, double sl) {
-    int row = blockIdx.y * 16 + threadIdx.y;
-    int col = (blockIdx.x * 16 + threadIdx.x) * 2;
+    // blockIdx.x: n_tiles, blockIdx.y: k_tiles. Block size: (32, 32)
+    // s is k x n (r x c).
+    int local_k = threadIdx.x; // 0..31
+    int local_n = threadIdx.y; // 0..31
+    int tile_n = blockIdx.x;
+    int tile_k = blockIdx.y;
+
     const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
-    if (row < r && col + 1 < c) {
-        double2 v2 = *(const double2*)&s[(size_t)row * c + col];
-        int32_t iv[2] = {0, 0};
+    size_t padded_size = (size_t)((c + 63) / 64) * ((r + 31) / 32) * 2048;
+    int num_tiles_k = (r + 31) / 32;
+
+    // A block (32x32) processes a 32x32 sub-tile of a 64x32 tile.
+    // There are 2 such sub-tiles in a 64x32 tile vertically (n direction).
+    // Launch with grid (num_tiles_n * 2, num_tiles_k).
+    int n_idx = (tile_n / 2) * 64 + (tile_n % 2) * 32 + local_n;
+    int k_idx = tile_k * 32 + local_k;
+
+    if (k_idx < r && n_idx < c) {
+        double v = s[(size_t)k_idx * c + n_idx];
+        int32_t iv = 0;
+        if (v != 0.0) {
+            if (m == 0) iv = __double2int_rn(v * sh);
+            else iv = __double2int_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl);
+        }
         
-        #pragma unroll
-        for(int i = 0; i < 2; i++) {
-            double v = (i == 0) ? v2.x : v2.y;
-            if (v != 0.0) { 
-                if (m == 0) iv[i] = __double2int_rn(v * sh); 
-                else iv[i] = __double2int_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl); 
-            }
-        }
-        for (int p = 0; p < 7; p++) { 
-            #pragma unroll
-            for(int i = 0; i < 2; i++) {
-                int32_t rem = iv[i] % pr[p]; 
-                if (rem < 0) rem += pr[p]; 
-                d[p * ((size_t)r * c) + (size_t)(col + i) * r + row] = (int8_t)rem;
-            }
-        }
-    } else if (row < r && col < c) {
-        for(int i = 0; i < 2 && col + i < c; i++) {
-            double v = s[(size_t)row * c + col + i]; 
-            int64_t iv = 0;
-            if (v != 0.0) { 
-                if (m == 0) iv = __double2ll_rn(v * sh); 
-                else iv = __double2ll_rn((v - (double)__double2ll_rn(v * sh) / sh) * sl); 
-            }
-            for (int p = 0; p < 7; p++) { 
-                int32_t rem = iv % pr[p]; 
-                if (rem < 0) rem += pr[p]; 
-                d[p * ((size_t)r * c) + (size_t)(col + i) * r + row] = (int8_t)rem; 
-            }
+        size_t out_off = (size_t)( (n_idx / 64) * num_tiles_k + tile_k ) * 2048 + (n_idx % 64) * 32 + local_k;
+        for (int p = 0; p < 7; p++) {
+            int32_t rem = iv % pr[p];
+            if (rem < 0) rem += pr[p];
+            d[p * padded_size + out_off] = (int8_t)rem;
         }
     }
 }
@@ -652,9 +674,11 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
     __shared__ alignas(16) int8_t sa[2][128][48], sb[2][64][48];
     uint64_t final_weighted_sum[2][4][4];
     for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int r = 0; r < 4; r++) final_weighted_sum[i][j][r] = 0;
+    
     M = d_M_arr[nl]; int off = d_coeff_offsets[nl];
 
-    size_t mk = (size_t)m * k, kn = (size_t)k * n;
+    size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
+    size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
 
     for (int p = 0; p < nl; p++) {
         int32_t cf[2][4][4];
@@ -662,22 +686,25 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
 
         // Load sa: 128 rows x 32 cols. 256 threads * 16 bytes = 4096 bytes. (128*32 = 4096).
         int m_idx = tid / 2, k_idx = (tid % 2) * 16;
-        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][k_idx], &A8[p * mk + (size_t)(rb + m_idx) * k + k_idx]); else *(int4*)&sa[0][m_idx][k_idx] = make_int4(0, 0, 0, 0);
+        const int8_t* ptr_A8 = &A8[p * padded_mk + get_A8_offset(rb + m_idx, k_idx, m, k)];
+        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][k_idx], ptr_A8); else *(int4*)&sa[0][m_idx][k_idx] = make_int4(0, 0, 0, 0);
 
         // Load sb: 64 rows x 32 cols. 128 loads of 16 bytes.
+        int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
+        const int8_t* ptr_B8 = &B8[p * padded_kn + get_B8_offset(cb + n_idx, kb_idx, n, k)];
         if (tid < 128) {
-            int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
-            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][kb_idx], &B8[p * kn + (size_t)(cb + n_idx) * k + kb_idx]); else *(int4*)&sb[0][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
+            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][kb_idx], ptr_B8); else *(int4*)&sb[0][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
         }
         cp_async_commit();
 
         for (int ck = 0; ck < k; ck += 32) {
+            ptr_A8 += 4096;
+            ptr_B8 += 2048;
             int cbuf = (ck / 32) % 2, fbuf = 1 - cbuf;
             if (ck + 32 < k) {
-                if (rb + m_idx < m && ck + 32 + k_idx < k) cp_async_16(&sa[fbuf][m_idx][k_idx], &A8[p * mk + (size_t)(rb + m_idx) * k + ck + 32 + k_idx]); else *(int4*)&sa[fbuf][m_idx][k_idx] = make_int4(0, 0, 0, 0);
+                if (rb + m_idx < m && ck + 32 + k_idx < k) cp_async_16(&sa[fbuf][m_idx][k_idx], ptr_A8); else *(int4*)&sa[fbuf][m_idx][k_idx] = make_int4(0, 0, 0, 0);
                 if (tid < 128) {
-                    int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
-                    if (cb + n_idx < n && ck + 32 + kb_idx < k) cp_async_16(&sb[fbuf][n_idx][kb_idx], &B8[p * kn + (size_t)(cb + n_idx) * k + ck + 32 + kb_idx]); else *(int4*)&sb[fbuf][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
+                    if (cb + n_idx < n && ck + 32 + kb_idx < k) cp_async_16(&sb[fbuf][n_idx][kb_idx], ptr_B8); else *(int4*)&sb[fbuf][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
                 }
                 cp_async_commit(); cp_async_wait_1();
             } else {
@@ -735,7 +762,7 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
     }
 }
 
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(256, 3)
 void decoupled_crt_pass_kernel(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, double* __restrict__ C, const uint64_t* mA, const uint64_t* mB, int m, int n, int k, double inv) {
     KernelHeteroConfig cfg;
     cfg.enable_fp64 = 0;
@@ -809,28 +836,34 @@ static KernelHeteroConfig make_kernel_config(const OzakiConfig& config) {
 
 
 __global__ void precompute_modulo_kernel_p26(const double* __restrict__ s, int8_t* __restrict__ d, int r, int c, int m, double sh, double sl) {
-    int row = blockIdx.y * 16 + threadIdx.y, col = (blockIdx.x * 16 + threadIdx.x) * 2;
+    int local_k = threadIdx.x; int local_m = threadIdx.y;
+    int tile_k = blockIdx.x; int tile_m = blockIdx.y;
     const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
-    if (row < r && col + 1 < c) {
-        double2 v2 = *(const double2*)&s[(size_t)row * c + col];
-        int32_t iv[2] = {__double2int_rn(v2.x * sh), __double2int_rn(v2.y * sh)};
-        for (int p = 0; p < 7; p++) {
-            int16_t rem_p = 0;
-            for(int i=0; i<2; i++) { int16_t rem = iv[i] % pr[p]; if(rem<0) rem+=pr[p]; rem_p |= ((rem&0xFF)<<(i*8)); }
-            *(int16_t*)&d[p * ((size_t)r * c) + (size_t)row * c + col] = rem_p;
-        }
+    size_t padded_size = (size_t)((r + 127) / 128) * ((c + 31) / 32) * 4096;
+    int num_tiles_k = (c + 31) / 32;
+    int m_idx = (tile_m / 4) * 128 + (tile_m % 4) * 32 + local_m;
+    int k_idx = tile_k * 32 + local_k;
+    if (m_idx < r && k_idx < c) {
+        double v = s[(size_t)m_idx * c + k_idx];
+        int32_t iv = (v == 0.0) ? 0 : __double2int_rn(v * sh);
+        size_t out_off = (size_t)( (m_idx / 128) * num_tiles_k + tile_k ) * 4096 + (m_idx % 128) * 32 + local_k;
+        for (int p = 0; p < 7; p++) { int32_t rem = iv % pr[p]; if (rem < 0) rem += pr[p]; d[p * padded_size + out_off] = (int8_t)rem; }
     }
 }
 
 __global__ void precompute_modulo_kernel_B_p26(const double* __restrict__ s, int8_t* __restrict__ d, int r, int c, int m, double sh, double sl) {
-    int row = blockIdx.y * 16 + threadIdx.y, col = (blockIdx.x * 16 + threadIdx.x) * 2;
+    int local_k = threadIdx.x; int local_n = threadIdx.y;
+    int tile_n = blockIdx.x; int tile_k = blockIdx.y;
     const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
-    if (row < r && col + 1 < c) {
-        double2 v2 = *(const double2*)&s[(size_t)row * c + col];
-        int32_t iv[2] = {__double2int_rn(v2.x * sh), __double2int_rn(v2.y * sh)};
-        for (int p = 0; p < 7; p++) {
-            for(int i=0; i<2; i++) { int32_t rem = iv[i] % pr[p]; if(rem<0) rem+=pr[p]; d[p * ((size_t)r * c) + (size_t)(col + i) * r + row] = (int8_t)rem; }
-        }
+    size_t padded_size = (size_t)((c + 63) / 64) * ((r + 31) / 32) * 2048;
+    int num_tiles_k = (r + 31) / 32;
+    int n_idx = (tile_n / 2) * 64 + (tile_n % 2) * 32 + local_n;
+    int k_idx = tile_k * 32 + local_k;
+    if (k_idx < r && n_idx < c) {
+        double v = s[(size_t)k_idx * c + n_idx];
+        int32_t iv = (v == 0.0) ? 0 : __double2int_rn(v * sh);
+        size_t out_off = (size_t)( (n_idx / 64) * num_tiles_k + tile_k ) * 2048 + (n_idx % 64) * 32 + local_k;
+        for (int p = 0; p < 7; p++) { int32_t rem = iv % pr[p]; if (rem < 0) rem += pr[p]; d[p * padded_size + out_off] = (int8_t)rem; }
     }
 }
 
@@ -876,19 +909,21 @@ __global__ void hybrid_ozaki_persistent_kernel(
         for (int kk = 0; kk < k; kk += 32) {
             int b_idx = (kk / 32) % 2;
             int k_size = min(32, k - kk);
-            
+            size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
+            size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
+
             for (int p = 0; p < 7; ++p) {
-                const int8_t* Ap = A8_h + p * ((size_t)m * k);
-                const int8_t* Bp = B8_h + p * ((size_t)k * n);
+                const int8_t* Ap = A8_h + p * padded_mk;
+                const int8_t* Bp = B8_h + p * padded_kn;
                 
                 for (int i = threadIdx.x; i < 64 * k_size; i += 256) {
                     int r = i / k_size, c = i % k_size;
-                    int8_t val = (tile_m + r < m && kk + c < k) ? Ap[(size_t)(tile_m + r) * k + kk + c] : 0;
+                    int8_t val = (tile_m + r < m && kk + c < k) ? Ap[get_A8_offset(tile_m + r, kk + c, m, k)] : 0;
                     sA8[p * 4096 + b_idx * 2048 + r * 32 + c] = val;
                 }
                 for (int i = threadIdx.x; i < k_size * 64; i += 256) {
                     int r = i / 64, c = i % 64;
-                    int8_t val = (kk + r < k && tile_n + c < n) ? Bp[(size_t)(tile_n + c) * k + (kk + r)] : 0;
+                    int8_t val = (kk + r < k && tile_n + c < n) ? Bp[get_B8_offset(tile_n + c, kk + r, n, k)] : 0;
                     sB8[p * 4096 + b_idx * 2048 + r * 64 + c] = val;
                 }
             }
@@ -1072,8 +1107,13 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         cudaStream_t st; cudaStreamCreate(&st);
         split_high_low_kernel<<<((size_t)m*k+255)/256, 256, 0, st>>>(dA, nullptr, nullptr, dA_hi_f32, dA_low_f32, (int)(m*k), config_.split_fp64_bits);
         split_high_low_kernel<<<((size_t)k*n+255)/256, 256, 0, st>>>(dB, nullptr, nullptr, dB_hi_f32, dB_low_f32, (int)(k*n), config_.split_fp64_bits);
-        precompute_modulo_kernel_p26<<<dim3((k+31)/32, (m+15)/16), dim3(16,16), 0, st>>>(dA, dA8_h, m, k, 0, pow(2.0,15.0), pow(2.0,30.0));
-        precompute_modulo_kernel_B_p26<<<dim3((n+31)/32, (k+15)/16), dim3(16,16), 0, st>>>(dB, dB8_h, k, n, 0, pow(2.0,15.0), pow(2.0,30.0));
+        
+        dim3 pre_block(32, 32);
+        dim3 pre_grid_A((k + 31) / 32, ((m + 127) / 128) * 4);
+        dim3 pre_grid_B(((n + 63) / 64) * 2, (k + 31) / 32);
+        precompute_modulo_kernel_p26<<<pre_grid_A, pre_block, 0, st>>>(dA, dA8_h, m, k, 0, pow(2.0,15.0), pow(2.0,30.0));
+        precompute_modulo_kernel_B_p26<<<pre_grid_B, pre_block, 0, st>>>(dB, dB8_h, k, n, 0, pow(2.0,15.0), pow(2.0,30.0));
+        
         int num_sms; cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
         cudaMemsetAsync(d_global_work_queue, 0, sizeof(int), st);
         cudaFuncSetAttribute(hybrid_ozaki_persistent_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96*1024);
@@ -1187,10 +1227,14 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         B_tc = dB_low;
     }
 
-    precompute_modulo_kernel<<<dim3((k + 31) / 32, (m + 15) / 16), dim3(16, 16), 0, stream_tc>>>(A_tc, dA8_h, m, k, 0, sh, sl);
-    precompute_modulo_kernel<<<dim3((k + 31) / 32, (m + 15) / 16), dim3(16, 16), 0, stream_tc>>>(A_tc, dA8_l, m, k, 1, sh, sl);
-    precompute_modulo_kernel_B<<<dim3((n + 31) / 32, (k + 15) / 16), dim3(16, 16), 0, stream_tc>>>(B_tc, dB8_h, k, n, 0, sh, sl);
-    precompute_modulo_kernel_B<<<dim3((n + 31) / 32, (k + 15) / 16), dim3(16, 16), 0, stream_tc>>>(B_tc, dB8_l, k, n, 1, sh, sl);
+    dim3 pre_block(32, 32);
+    dim3 pre_grid_A((k + 31) / 32, ((m + 127) / 128) * 4);
+    dim3 pre_grid_B(((n + 63) / 64) * 2, (k + 31) / 32);
+
+    precompute_modulo_kernel<<<pre_grid_A, pre_block, 0, stream_tc>>>(A_tc, dA8_h, m, k, 0, sh, sl);
+    precompute_modulo_kernel<<<pre_grid_A, pre_block, 0, stream_tc>>>(A_tc, dA8_l, m, k, 1, sh, sl);
+    precompute_modulo_kernel_B<<<pre_grid_B, pre_block, 0, stream_tc>>>(B_tc, dB8_h, k, n, 0, sh, sl);
+    precompute_modulo_kernel_B<<<pre_grid_B, pre_block, 0, stream_tc>>>(B_tc, dB8_l, k, n, 1, sh, sl);
 
     compute_slice_max_kernel<<<dim3(nm, 1), 256, 0, stream_tc>>>(A_tc, nullptr, dmA_h, nullptr, m, n, k, 0, 0, sh, sl);
     compute_slice_max_kernel<<<dim3(nm, 1), 256, 0, stream_tc>>>(A_tc, nullptr, dmA_l, nullptr, m, n, k, 1, 0, sh, sl);

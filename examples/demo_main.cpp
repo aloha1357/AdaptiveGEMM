@@ -83,7 +83,7 @@ int main() {
     CHECK_CUDA(cudaMemset(d_C, 0, element_count * sizeof(double)));
 
     OzakiConfig config;
-    config.mode = ExecutionMode::Phase22;
+    config.mode = ExecutionMode::Phase24ExtremeMix;
     AdaptiveOzakiEngine engine(config);
 
     engine.execute(d_A, d_B, d_C, n, n, n);
