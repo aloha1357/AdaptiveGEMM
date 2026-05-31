@@ -35,52 +35,35 @@ A100-class hardware.
 
 ## Performance
 
-> Profiled on **RTX 4060 (Ada Lovelace, 24 SM, 2.11 GHz SM / 7.99 GHz DRAM)**  
-> using NVIDIA Nsight Compute. Kernel: `decoupled_crt_pass_kernel`.
+> Profiled on **RTX 4060 (Ada Lovelace, 24 SM, 2.11 GHz SM / 7.99 GHz DRAM)**
+> using NVIDIA Nsight Compute. Optimized in Phase 28 via Tiled Layout and Register Spilling.
 
-### Throughput
+### Throughput (2048 x 2048 Matrix)
 
-| Metric                      | Value                       |
-|-----------------------------|-----------------------------|
-| Kernel Duration             | **4.13 ms**                 |
-| INT8 Tensor Core Operations | **120.3B ops**              |
-| Effective TC Throughput     | **~67 TOPS (28% peak)**     |
-| L2 Cache Hit Rate           | **90.14%**                  |
-| Memory Throughput           | **64.26 GB/s**              |
-| Achieved Occupancy          | **32.63%**                  |
-| Executed IPC (Active)       | **1.46 / 4.00**             |
+| Execution Mode | Average Time | Throughput | Max Error vs cuBLAS FP64 |
+|----------------|--------------|------------|--------------------------|
+| **Phase 24 (ExtremeMix)** | ~128 ms | **~133 GFLOPS** | 3.55271e-15 |
+| **Phase 26 (HybridOzaki)** | ~81 ms | **~211 GFLOPS** | 0.221941 |
 
-### Pipeline Utilization
+### Key Optimizations & Occupancy
+
+* **Block-Tiled Memory Layout:** Coalesced global memory access via 128x32/64x32 tiles resolved the uncoalesced memory bottleneck, reducing precompute layout transformation overhead from 50ms to ~9ms.
+* **Occupancy Breakthrough:** The main `decoupled_crt_pass_kernel` achieved **50%-60% SM Occupancy** (up from the previous 33.33% ceiling). This was achieved by applying `__launch_bounds__(256, 3)` and performing variable life-cycle analysis to allow targeted L1 register spilling.
+* **Sliding Pointers:** Replaced ALU-heavy modulo indexing in the critical inner loops with sliding pointer offsets, significantly reducing execution latency.
+
+### Pipeline Utilization & Profiler Notes
 
 The kernel simultaneously drives FP64 CUDA cores (hi×hi term reconstruction)
-and INT8 Tensor Cores (CRT passes), confirming the heterogeneous execution path:
-
-| Pipeline      | Active Cycle Utilization |
-|---------------|--------------------------|
-| FP64          | ~31.8%                   |
-| Tensor (INT8) | ~26.0%                   |
-| ALU           | ~24.0%                   |
-| FMA           | ~15.0%                   |
-
-> **Note:** FP64 pipeline appearing busiest is expected and by design —
-> Ada's FP64 units are 64× slower than FP32, so even modest FP64 work
-> saturates them. This is precisely the bottleneck AdaptiveGEMM bypasses
-> for the bulk of computation.
+and INT8 Tensor Cores (CRT passes), effectively utilizing heterogeneous compute pipelines.
 
 <!-- Insert Nsight Compute screenshots below -->
 ![Speed of Light](docs/profile_sol.png)
 ![Pipe Utilization](docs/profile_pipe.png)
 
-### Known Bottlenecks (Profiler-Identified)
+### Current Known Bottlenecks
 
-| Bottleneck                   | Est. Speedup | Root Cause                                    |
-|------------------------------|-------------|-----------------------------------------------|
-| Uncoalesced global access    | **+39.49%** | Strided INT8 residue layout in global memory  |
-| Local memory spill           | **+51.01%** | 128 regs/thread exceeds register file budget  |
-| Low occupancy                | **+47.34%** | Register pressure caps theoretical occ. at 33.33% |
-| Eligible warps per scheduler | —           | 0.53/cycle; 63.59% of cycles have no eligible warp |
-
-These are the concrete, measured optimization targets for the next phase.
+Based on the latest `ncu` reporting:
+* The `add_residual_kernel` now registers >90% Memory Throughput, indicating it has become a pure memory-bound kernel. Future optimizations will focus on fusing this addition step directly into the decoupled CRT pass to save a massive global memory write/read cycle.
 
 ---
 

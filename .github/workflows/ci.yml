@@ -5,6 +5,7 @@ on:
     branches:
       - public-release
       - main
+      - phase28-perf-tuning
   pull_request:
   workflow_dispatch:
 
