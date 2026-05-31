@@ -62,15 +62,17 @@ void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     cudaMalloc(&dA_low_f32, mk * sizeof(float));
     cudaMalloc(&dB_hi_f32, kn * sizeof(float));
     cudaMalloc(&dB_low_f32, kn * sizeof(float));
-    
-    workspace_allocated_ = true;
-}
+    cudaMalloc(&d_global_work_queue, sizeof(int));
 
-void AdaptiveOzakiEngine::freeWorkspace() {
+    workspace_allocated_ = true;
+    }
+
+    void AdaptiveOzakiEngine::freeWorkspace() {
     if (!workspace_allocated_) return;
     cudaFree(dmA_h); cudaFree(dmA_l); cudaFree(dmB_h); cudaFree(dmB_l);
     cudaFree(dA8_h); cudaFree(dA8_l); cudaFree(dB8_h); cudaFree(dB8_l);
     cudaFree(dA_hi_f32); cudaFree(dA_low_f32); cudaFree(dB_hi_f32); cudaFree(dB_low_f32);
+    cudaFree(d_global_work_queue);
     workspace_allocated_ = false;
 }
 
@@ -832,13 +834,11 @@ __global__ void precompute_modulo_kernel_B_p26(const double* __restrict__ s, int
     }
 }
 
-__device__ int global_work_queue = 0;
-
 __global__ void hybrid_ozaki_persistent_kernel(
     const int8_t* __restrict__ A8_h, const int8_t* __restrict__ B8_h,
     const float* __restrict__ A_hi_f32, const float* __restrict__ A_low_f32,
     const float* __restrict__ B_hi_f32, const float* __restrict__ B_low_f32,
-    double* __restrict__ C, int m, int n, int k, double inv) {
+    double* __restrict__ C, int m, int n, int k, double inv, int* __restrict__ d_work_queue) {
     extern __shared__ int8_t shared_mem[];
     int8_t* sA8 = &shared_mem[0];
     int8_t* sB8 = &sA8[28672];
@@ -857,7 +857,7 @@ __global__ void hybrid_ozaki_persistent_kernel(
     };
 
     while (true) {
-        if (threadIdx.x == 0) tile_idx = atomicAdd(&global_work_queue, 1);
+        if (threadIdx.x == 0) tile_idx = atomicAdd(d_work_queue, 1);
         __syncthreads();
         int ct = tile_idx; if (ct >= total_tiles) break;
         int tile_m = (ct % total_tiles_m) * 64, tile_n = (ct / total_tiles_m) * 64;
@@ -1057,9 +1057,9 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         precompute_modulo_kernel_p26<<<dim3((k+31)/32, (m+15)/16), dim3(16,16), 0, st>>>(dA, dA8_h, m, k, 0, pow(2.0,15.0), pow(2.0,30.0));
         precompute_modulo_kernel_B_p26<<<dim3((n+31)/32, (k+15)/16), dim3(16,16), 0, st>>>(dB, dB8_h, k, n, 0, pow(2.0,15.0), pow(2.0,30.0));
         int num_sms; cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
-        int zero = 0; cudaMemcpyToSymbol(global_work_queue, &zero, sizeof(int));
+        cudaMemsetAsync(d_global_work_queue, 0, sizeof(int), st);
         cudaFuncSetAttribute(hybrid_ozaki_persistent_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96*1024);
-        hybrid_ozaki_persistent_kernel<<<num_sms, 256, 96*1024, st>>>(dA8_h, dB8_h, dA_hi_f32, dA_low_f32, dB_hi_f32, dB_low_f32, dC, m, n, k, pow(2.0,-30.0));
+        hybrid_ozaki_persistent_kernel<<<num_sms, 256, 96*1024, st>>>(dA8_h, dB8_h, dA_hi_f32, dA_low_f32, dB_hi_f32, dB_low_f32, dC, m, n, k, pow(2.0,-30.0), d_global_work_queue);
         cudaStreamSynchronize(st); cudaStreamDestroy(st);
         return;
     }

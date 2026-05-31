@@ -75,6 +75,7 @@ private:
     // Workspace pointers
     int8_t *dA8_h = nullptr, *dA8_l = nullptr, *dB8_h = nullptr, *dB8_l = nullptr;
     uint64_t *dmA_h = nullptr, *dmA_l = nullptr, *dmB_h = nullptr, *dmB_l = nullptr;
+    int* d_global_work_queue = nullptr;
     
     // Low-precision buffers for cross-terms
     float *dA_hi_f32 = nullptr, *dA_low_f32 = nullptr;
