@@ -52,7 +52,14 @@
     透過 Nsight Compute 分析我們將高頻區域委派給 `cublasDgemm` 時發現，受限於 RTX 4060 (Ada Lovelace) 上極端閹割的 FP64 單元 (1/64 比例)，呼叫 cuBLAS 的耗時反而遠大於我們自己撰寫的 Naive Masked 混合 Kernel，因此最終策略將其捨棄，證明在特定閾值分割下自行實作是最佳解。
 *   **已知問題**：根據 `ncu` 報告，目前的 `add_residual_kernel` DRAM Throughput 高達 90% 以上，已經成為純粹的 Memory Bound Kernel。
 
-## 5. Next Steps (給接手者的下一步行動建議)
+## 5. CI / Self-hosted Runner 執行規範 (重要)
+**每次 Commit / Push 時，GitHub Actions 包含了 GPU 實機驗證的環節。** 
+由於 GitHub 官方的 Runner 沒有配備我們要測試的 Ada Tensor Core GPU，因此專案設定了 `self-hosted` 標籤來依賴您本地的機器：
+*   **本地 Linux 啟動要求**：在推送 (Push) 程式碼至 `public-release` 或 `main` 之前或當下，**必須確保本地端的 WSL Ubuntu (Linux) 已啟動，並且運行了 GitHub Actions Runner**。
+*   **啟動方式**：進入 WSL 的 `~/actions-runner` 資料夾，並執行 `./run.sh`。若未開啟，CI 的 `gpu-validate` 階段將會一直卡在 `Queued` 等待中。
+*   此項限制也適用於任何會觸發 CI 的 Pull Request。
+
+## 6. Next Steps (給接手者的下一步行動建議)
 1.  **提交變更 (Commit Changes)**：
     目前的最佳化結果均存在於本地端，請整理 `AdaptiveOzaki.cu` 與 `demo_main.cpp` 的變更，提交 Commit 並推播回 Git Repository。
 2.  **Kernel Fusion 評估**：
