@@ -45,6 +45,18 @@ AdaptiveGEMM 的切入點，就是把「高精度需求」拆成「可在 Tensor
 這樣做的目的很直接：把原本 FP64 bottleneck 轉成 high-throughput INT8 Tensor Core bottleneck，然後再由重建層把精度拉回來。
 
 ### 3. Memory optimization: bank conflict and register pressure control
+<!-- Insert Nsight Compute screenshots below -->
+### Speed of Light
+
+<p align="center">
+  <img src="docs/profile_sol.png" alt="Speed of Light" width="88%" />
+</p>
+
+### Pipe Utilization
+
+<p align="center">
+  <img src="docs/profile_pipe.png" alt="Pipe Utilization" width="88%" />
+</p>
 
 如果 Tensor Core 是算力核心，Shared Memory 與 register file 就是這個專案真正的戰場。公開版 README 建議你在此保留以下說明：
 
