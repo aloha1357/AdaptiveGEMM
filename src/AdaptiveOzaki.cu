@@ -869,7 +869,7 @@ __global__ void hybrid_ozaki_persistent_kernel(
         for(int p=0; p<7; p++) for(int i=0; i<8; i++) for(int j=0; j<4; j++) prime_acc[p][i][j] = 0;
 
         nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> c_frag_tf32[2][2];
-        if (warp_id < 4) {
+        if (warp_id >= 4) {
             for(int i=0; i<2; i++) for(int j=0; j<2; j++) nvcuda::wmma::fill_fragment(c_frag_tf32[i][j], 0.0f);
         }
 
@@ -887,7 +887,7 @@ __global__ void hybrid_ozaki_persistent_kernel(
                     sA8[p * 4096 + b_idx * 2048 + r * 32 + c] = val;
                 }
                 for (int i = threadIdx.x; i < k_size * 64; i += 256) {
-                    int c = i / k_size, r = i % k_size;
+                    int r = i / 64, c = i % 64;
                     int8_t val = (kk + r < k && tile_n + c < n) ? Bp[(size_t)(tile_n + c) * k + (kk + r)] : 0;
                     sB8[p * 4096 + b_idx * 2048 + r * 64 + c] = val;
                 }
@@ -972,20 +972,38 @@ __global__ void hybrid_ozaki_persistent_kernel(
                 }
             }
 
-            if (warp_id < 4) {
-                int w_row = (warp_id / 2) * 32, w_col = (warp_id % 2) * 32;
-                float* pA_hi = &sTF32[b_idx * 4096];
-                float* pB_hi = &sTF32[b_idx * 4096 + 2048];
-
+            if (warp_id >= 4) {
+                int w_row = ((warp_id - 4) / 2) * 32, w_col = ((warp_id - 4) % 2) * 32;
                 for (int k_s = 0; k_s < 32; k_s += 8) {
-                    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_hi[2];
-                    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> b_hi[2];
+                    if (kk + k_s < k) {
+                        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_hi[2], a_lo[2];
+                        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> b_hi[2], b_lo[2];
 
-                    for(int i=0; i<2; i++) nvcuda::wmma::load_matrix_sync(a_hi[i], &pA_hi[(w_row + i*16) * 32 + k_s], 32);
-                    for(int j=0; j<2; j++) nvcuda::wmma::load_matrix_sync(b_hi[j], &pB_hi[k_s * 64 + (w_col + j*16)], 64);
+                        for(int i=0; i<2; i++) {
+                            int r_idx = tile_m + w_row + i*16;
+                            if (r_idx < m) {
+                                nvcuda::wmma::load_matrix_sync(a_hi[i], &A_hi_f32[(size_t)r_idx * k + kk + k_s], k);
+                                nvcuda::wmma::load_matrix_sync(a_lo[i], &A_low_f32[(size_t)r_idx * k + kk + k_s], k);
+                            } else {
+                                nvcuda::wmma::fill_fragment(a_hi[i], 0.0f);
+                                nvcuda::wmma::fill_fragment(a_lo[i], 0.0f);
+                            }
+                        }
+                        for(int j=0; j<2; j++) {
+                            int c_idx = tile_n + w_col + j*16;
+                            if (c_idx < n) {
+                                nvcuda::wmma::load_matrix_sync(b_hi[j], &B_hi_f32[(size_t)(kk + k_s) * n + c_idx], n);
+                                nvcuda::wmma::load_matrix_sync(b_lo[j], &B_low_f32[(size_t)(kk + k_s) * n + c_idx], n);
+                            } else {
+                                nvcuda::wmma::fill_fragment(b_hi[j], 0.0f);
+                                nvcuda::wmma::fill_fragment(b_lo[j], 0.0f);
+                            }
+                        }
 
-                    for(int i=0; i<2; i++) for(int j=0; j<2; j++) {
-                        nvcuda::wmma::mma_sync(c_frag_tf32[i][j], a_hi[i], b_hi[j], c_frag_tf32[i][j]);
+                        for(int i=0; i<2; i++) for(int j=0; j<2; j++) {
+                            nvcuda::wmma::mma_sync(c_frag_tf32[i][j], a_hi[i], b_lo[j], c_frag_tf32[i][j]);
+                            nvcuda::wmma::mma_sync(c_frag_tf32[i][j], a_lo[i], b_hi[j], c_frag_tf32[i][j]);
+                        }
                     }
                 }
             }
@@ -1030,8 +1048,8 @@ __global__ void hybrid_ozaki_persistent_kernel(
             }
         }
 
-        if (warp_id < 4) {
-            int w_row = (warp_id / 2) * 32, w_col = (warp_id % 2) * 32;
+        if (warp_id >= 4) {
+            int w_row = ((warp_id - 4) / 2) * 32, w_col = ((warp_id - 4) % 2) * 32;
             for(int i=0; i<2; i++) for(int j=0; j<2; j++) {
                 int r_c = tile_m + w_row + i*16, c_c = tile_n + w_col + j*16;
                 float temp[16*16];
