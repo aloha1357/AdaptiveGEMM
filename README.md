@@ -43,7 +43,6 @@ A100-class hardware.
 | Execution Mode | Average Time | Throughput | Max Error vs cuBLAS FP64 |
 |----------------|--------------|------------|--------------------------|
 | **Phase 24 (ExtremeMix)** | ~128 ms | **~133 GFLOPS** | 3.55271e-15 |
-| **Phase 26 (HybridOzaki)** | ~81 ms | **~211 GFLOPS** | 0.221941 |
 
 ### Key Optimizations & Occupancy
 
@@ -160,21 +159,6 @@ __syncthreads();
 Combined with `ldmatrix.sync` for shared memory → register tile loading,
 this pipeline achieves the **90.14% L2 hit rate** observed in profiling.
 
-### Adaptive Dispatch: Runtime Hardware Profiling
-
-At launch, `profileHardwareRatio()` microbenchmarks all relevant hardware paths:
-
-| Path measured         | Purpose                                     |
-|-----------------------|---------------------------------------------|
-| FP64 FMA              | Determine if kernel-fused FP64 is worthwhile |
-| FP32 FMA              | Cross-term baseline                         |
-| FP16 Tensor Core      | Alternative TC path                         |
-| TF32 Tensor Core      | Cross-term acceleration option              |
-| INT8 Tensor Core      | Primary execution path                      |
-
-Based on measured ratios, the engine dynamically selects the optimal
-execution strategy — making AdaptiveGEMM portable across Ada, Ampere,
-and Turing consumer GPUs without compile-time specialization.
 
 ---
 
@@ -316,9 +300,6 @@ AdaptiveGEMM 透過 Ozaki Scheme 將 FP64 精度需求拆解為多組 INT8 子�
 `cp.async.cg.shared.global` + `ldmatrix.sync` 非同步預取，
 達到 **90.14% L2 命中率**。
 
-### 執行期硬體偵測
-啟動時 microbenchmark 各路徑算力比（FP64 / FP32 / FP16 TC / TF32 TC / INT8 TC），
-動態選擇最優執行策略，支援 Ada / Ampere / Turing 架構。
 
 ## 已知瓶頸（Profiler 量測）
 
