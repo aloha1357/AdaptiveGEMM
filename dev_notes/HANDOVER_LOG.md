@@ -8,16 +8,19 @@
 ## [Version 1.1.0] - Stage: FWT to GEMM Conversion
 
 **時間/階段**：Phase 2 (核心演算法置換)
-**當前狀態**：開發中 (In Progress)
+**當前狀態**：已完成 (Completed)
 
-### 🔵 本階段已啟動進度 (Started in v1.1.0)
+### 🔵 本階段已完成進度 (Completed in v1.1.0)
 1. **測試環境擴展**：
-   - 已修改 `bench_kernels.cu`，將 Qubit 數量提高至 $n=12$（觸發 `iqp_tc.cu` 的 `else` 邏輯）。
-2. **算子重構 (Tensor Reshaping)**：
-   - 於 `iqp_tc.cu` 內撰寫了 `iqp_phase_split_kernel`，成功將原本綁定在複數結構 (Complex) 的 Phase 計算打散，分離出實部與虛部矩陣 (`state_real` 與 `state_imag`)，這是交給 AdaptiveGEMM 計算的前置條件。
-3. **GEMM 規劃與未完成事項**：
-   - 已確立將 $n$ 分解為 $n_1$ 與 $n_2$ 的雙 GEMM 架構。
-   - 目前的執行會 Bypass 真正的矩陣乘法，導致 Max Error 高達 0.67，需等待後續將 Hadamard 變換矩陣 $A$ 正確生成並輸入給 `AdaptiveOzakiEngine::execute()` 來完成計算與結果收斂。
+   - 修改 `bench_kernels.cu`，將 Qubit 數量提高至 $n=12$，觸發了大型 Qubit 的 AdaptiveGEMM 路徑。
+2. **算子重構與引擎串接 (Tensor Reshaping & Engine Execution)**：
+   - 於 `iqp_tc.cu` 內撰寫了 `iqp_phase_split_kernel` 將狀態向量拆分為實部與虛部。
+   - 開發了 `generate_hadamard_matrix` 在 GPU 動態生成符合比例的 Hadamard 變換矩陣 $H$。
+   - 成功呼叫 `AdaptiveOzakiEngine::execute` 兩次 (分別處理實部與虛部)，由引擎將 FP64 拆解為 INT8 並分派給 Tensor Core 執行 `mma.sync` 運算。
+   - 透過 `recombine_complex_kernel` 成功將結果組裝回 `cuDoubleComplex` 格式。
+3. **驗證與 Profiling 成果**：
+   - 正確性驗證 (Correctness)：與原版演算法比對，**Max Absolute Error 僅為 `2.50841e-15`**，在雙精度浮點數中視同零誤差，完美過關。
+   - 效能剖析 (NCU Profiling)：成功擷取到引擎內部的 `accumulate_fused_kernel_masked`、`decoupled_crt_pass_kernel` 與 `residual_kernel` 軌跡。報告儲存於 `dev_notes/profile_v1.1.0_gemm.ncu-rep`。
 
 ---
 
