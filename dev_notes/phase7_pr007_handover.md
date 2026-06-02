@@ -19,9 +19,10 @@ Phase 4–5 已完成 Blocked TC-FWT 與 Implicit Ozaki Persistent Kernel。Phas
 | Driver | 581.57 |
 | CUDA | 13.0 |
 | NCU | 2024.3.0.0 (build 34567288) |
-| OS | Windows |
+| OS | Windows（本機）/ WSL2 Ubuntu（已驗證） |
+| WSL CUDA | 12.6（`/usr/local/cuda`），NCU 2024.3.2 |
 
-> WDDM 下 **persistent** Ozaki kernel 在 NCU 中會 `LaunchFailed`；需使用 Section 6 的 grid profiling kernel 或 Linux/TCC。
+> WDDM / WSL2 下 **Ozaki MMA kernel**（含 grid profiling 路徑）在 NCU 中皆 `LaunchFailed`；side kernel 可 profile。見 **Section 11**。
 
 ---
 
@@ -97,9 +98,8 @@ Phase 4–5 已完成 Blocked TC-FWT 與 Implicit Ozaki Persistent Kernel。Phas
 
 1. **已完成：** `OZAKI_NCU_PROFILE=1` → `implicit_hadamard_ozaki_grid_kernel_implicit`（static smem，一 tile 一 block）；正確性與 production persistent 路徑一致（batch=1 驗證 MAE=0）。
 2. **WDDM NCU：** grid kernel 在 NCU 下仍 `LaunchFailed`（inline MMA 限制）；評測請用 side kernels NCU + 一般 bench，或 **Linux/TCC** 跑完整 Ozaki NCU。
-3. 重跑 NCU（Linux）：`--kernel-name implicit_hadamard_ozaki_grid_kernel_implicit`，補 `sm__pipe_tensor_active`。
 3. 補 **Warp stall** / **bank conflict** metrics（01 framework Section 9–11）。
-4. Linux/TCC 上對 persistent kernel 做交叉驗證（可選）。
+4. **裸機 Linux**（非 WSL/Docker）上重試 Ozaki grid NCU + `sm__pipe_tensor_active`（見 Section 11）。
 5. PR 合併前：補 baseline vs TC **端到端** speedup 表。
 
 ---
@@ -114,6 +114,7 @@ Phase 4–5 已完成 Blocked TC-FWT 與 Implicit Ozaki Persistent Kernel。Phas
 | `dev_notes/02pr_refference.md` | PR 說服力檢查清單 |
 | `qdp/qdp-kernels/src/ImplicitHadamardOzaki.cu` | Persistent + **grid profiling** kernel |
 | `qdp/qdp-kernels/tests/bench_kernels.cu` | Bench + `IQP_NUM_SAMPLES` |
+| `qdp/qdp-kernels/scripts/wsl_build_and_ncu.sh` | WSL 一鍵編譯 + NCU 嘗試 |
 
 ---
 
@@ -135,6 +136,14 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__pipe_tensor_a
   --kernel-name implicit_hadamard_ozaki_grid_kernel_implicit --csv qdp/qdp-kernels/build/bench_kernels.exe 14 1
 ```
 
+**WSL2（Ubuntu）：**
+
+```powershell
+wsl -d Ubuntu -- bash /mnt/d/D_backup/2025/tum/26S/apache_mout/qdp/qdp-kernels/scripts/wsl_build_and_ncu.sh
+```
+
+產物：`build_wsl/bench_kernels`、`reports/ncu_ozaki_grid_wsl.csv`（Ozaki 仍可能 LaunchFailed）。
+
 ---
 
 ## 10. PR Review 對照 (02pr_refference checklist)
@@ -142,13 +151,49 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__pipe_tensor_a
 | 要求 | 狀態 |
 |------|------|
 | Baseline 定義 | 有（batch FWT）；端到端 speedup 表待補 |
-| NCU / Occupancy / DRAM | Side kernels 完成；Ozaki grid 待驗證 |
-| Tensor Utilization | 待 grid kernel NCU |
+| NCU / Occupancy / DRAM | Side kernels 完成（Windows + WSL）；Ozaki MMA NCU 失敗 |
+| Tensor Utilization | 待裸機 Linux；WSL/Docker 不保證 |
 | Accuracy (max abs error) | **0** @ N=14,16 |
 | Roofline / Warp stall | 未做（下一 PR 可補） |
 | 避免 peak TOPS 空話 | PR007 未使用 |
 
 ---
 
-**Handover status:** NCU partial + attribution documented | Grid profiling kernel in progress  
-**Regenerated:** 2026-06-02
+## 11. WSL2 / Docker 實測結論（2026-06-02）
+
+### 11.1 WSL2 Ubuntu 測試
+
+| 項目 | 結果 |
+|------|------|
+| GPU / Driver | `nvidia-smi` 正常（Driver 581.57，CUDA 13.0 API） |
+| 編譯 + bench（`OZAKI_NCU_PROFILE=1`） | **PASSED**，MAE=0 |
+| NCU `iqp_phase_split_kernel` | **成功**（例：SM ~67%，DRAM ~0.4%） |
+| NCU `implicit_hadamard_ozaki_grid_kernel_implicit` | **`LaunchFailed`**（與 Windows 相同） |
+
+**結論：** WSL2 **不是**「換個 Linux 就能量 Ozaki MMA」。它對 **bench / 正確性 / side-kernel NCU** 很有用；對 **inline MMA + 大 smem** 的完整 NCU，與 Windows 一樣仍卡住（WSL2 GPU 仍經 Windows 顯示驅動，`Disp.A On`）。
+
+### 11.2 Docker 會不會不一樣？
+
+**在 Windows 上開 Docker Desktop → 多半一樣。**
+
+| 場景 | 預期 |
+|------|------|
+| Docker Desktop（WSL2 後端 + GPU） | 與 WSL2 類似：跑 bench 可以，Ozaki MMA 的 NCU **很可能仍 LaunchFailed** |
+| Docker 內只跑 `bench_kernels`、不跑 NCU | 可以，適合 CI/他人重現數值 |
+| Docker 內跑 `ncu` | 容器需 `--gpus all` + 驅動/toolkit 掛載；**不保證**比 WSL 更好 |
+| 雲端 / 實驗室 **裸機 Linux**（無桌面 GPU） | 唯一仍值得認真嘗試的完整 NCU 路線 |
+
+Docker **不能**繞過「這顆 kernel 對 NCU replay 不友善」這件事；它只是多一層隔離，底層還是你的 4060 + Windows 驅動棧。
+
+### 11.3 覺得太難時，PR 怎麼交差（務實）
+
+Reviewer 要的是 **Performance Attribution**，不是「每顆 kernel 都有 NCU」：
+
+1. **必交：** bench 表 + MAE=0 + side-kernel NCU（phase split / modulo / FWT）+ bottleneck 文字（handover Q2–Q3）。
+2. **誠實註明：** Ozaki MMA 在 Windows/WSL/Docker+4060 下 NCU `LaunchFailed`；已提供 `OZAKI_NCU_PROFILE` grid 路徑供執行與對照。
+3. **可選加分：** 實驗室裸機 Linux 補一張 `sm__pipe_tensor_active`（不是 PR blocker，若導師堅持再排期）。
+
+---
+
+**Handover status:** NCU partial（side kernels OK on Win+WSL）| Grid profiling kernel shipped | Ozaki MMA NCU blocked on consumer GPU + host driver stack  
+**Updated:** 2026-06-02（含 WSL2 實測）

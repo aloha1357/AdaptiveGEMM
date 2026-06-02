@@ -177,9 +177,23 @@ Mitigations attempted (all still failed):
 
 Conclusion: WDDM + persistent kernel + inline MMA path remains non-profileable under NCU. This is a tooling limitation, not a functional kernel failure (kernel runs and passes correctness outside NCU).
 
+### 6.1 WSL2 retest (2026-06-02)
+
+Tested on **Ubuntu WSL2** with `/usr/local/cuda` (CUDA 12.6, NCU 2024.3.2):
+
+| Target | NCU on WSL2 |
+|--------|-------------|
+| `iqp_phase_split_kernel` | Success |
+| `implicit_hadamard_ozaki_grid_kernel_implicit` (`OZAKI_NCU_PROFILE=1`) | **LaunchFailed** (same as Windows) |
+
+Repro script: `qdp/qdp-kernels/scripts/wsl_build_and_ncu.sh`  
+Artifact: `qdp/qdp-kernels/reports/ncu_ozaki_grid_wsl.csv`
+
+**Docker Desktop (WSL2 GPU backend):** expect the same class of NCU failure for Ozaki MMA; use Docker for bench/CI, not as an NCU workaround on RTX 4060 + Windows host.
+
 ## 7. Recommended Path Forward
-1. **Run NCU on Linux or TCC**
-   - Use a headless GPU in TCC mode or a Linux environment to avoid WDDM profiling constraints.
+1. **Run NCU on bare-metal Linux (not WSL/Docker on Windows host)**
+   - WSL2 was tried; side kernels profile, Ozaki MMA still fails. Prefer lab/cloud Linux without desktop display binding.
 2. **Add a profiling-only non-persistent kernel**
    - Implement a kernel variant without the persistent work queue, and use it only when `OZAKI_NCU_PROFILE=1`.
 3. **Keep WDDM profiling for side kernels**
