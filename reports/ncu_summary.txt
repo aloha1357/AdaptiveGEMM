@@ -1,0 +1,43 @@
+PR007 NCU Summary — regenerated 2026-06-02
+GPU: RTX 4060 (SM 8.9, WDDM) | NCU 2024.3.0.0 | CUDA 13.0
+
+fwt_butterfly_batch_kernel (N=14, batch=1, 14 butterfly stages)
+------------------------------------------------------------
+  DRAM throughput: 33.49%
+  L2 throughput: 10.51%
+  SM throughput: 10.31%
+  Warps active: 21.73%
+  Registers / thread: 28
+  Shared memory / block: 1024
+  Kernel duration (us): 3.18
+
+iqp_phase_split_kernel
+----------------------
+  DRAM throughput: 0.42%
+  L2 throughput: 2.27%
+  SM throughput: 67.52%
+  Warps active: 37.51%
+  Registers / thread: 60
+  Shared memory / block: 1024
+  Kernel duration (us): 12.74
+
+precompute_modulo_kernel_p26_implicit
+-------------------------------------
+  DRAM throughput: 18.77%
+  L2 throughput: 5.64%
+  SM throughput: 17.12%
+  Warps active: 56.16%
+  Registers / thread: 28
+  Shared memory / block: 1024
+  Kernel duration (us): 2.88
+
+implicit_hadamard_ozaki_persistent_kernel_implicit
+------------------------------------------------
+  LaunchFailed under NCU on WDDM (OZAKI_NCU_PROFILE=1, batch=1).
+  Kernel runs correctly outside NCU; needs Linux/TCC for full metrics.
+
+Benchmark (bench_kernels_perf.exe, batch=128):
+  N=14: 93 us, max abs error 0, PASSED
+  N=16: 109 us, max abs error 0, PASSED
+
+Raw CSV: qdp/qdp-kernels/reports/ncu_*_clean.csv
