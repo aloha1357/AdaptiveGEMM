@@ -67,7 +67,7 @@ iThome Day 8～10 怎麼切，在 `D:\D_backup\2025\tum\26w\Ithome\cASE\Blog\blu
 
 優先順序：
 
-1. **smem / `ldmatrix` bank conflict**（pad 48 的 row-major，舊 NCU 說 conflict 仍高）
+1. ~~smem / `ldmatrix` bank conflict~~ 已做 XOR pad64，10.9 → 10.3 ms，誤差不變。還沒打掉 conflict。
 2. 下一個質數的 k=0 tile 提前 `cp.async`
 3. 公平賽：cuBLAS mantissa 16 / 24 / 34 / 53 vs Phase 22
 4. 若 34-bit 仍輸 3×，再評估 8-bit Scheme I（那是換架構，不是這顆 kernel 微調）

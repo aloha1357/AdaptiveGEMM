@@ -139,6 +139,20 @@ CRT 4 pass ≈ 2.35 ms/pass（原本 ~3.1 ms）。Wall time 13.6 → 10.9 ms（�
 
 還差 ~2.4 ms 才跟預設 emu 同一量級。下一步是 smem bank conflict / ldmatrix layout，不是再砍除法。
 
+### 2026-08-21 after smem XOR swizzle
+
+`sa/sb` pad 48→64，store / `ldmatrix` 用 `col ^ ((row & 3) << 4)`。誤差不變。
+
+| | ms | err |
+|---|---:|---|
+| native | 82.2 | — |
+| Phase 22 | **10.33** | 3.40e-9 |
+| cuBLAS emu | 8.52 | 2.84e-13 |
+
+CRT 9.38 → 8.86 ms。Wall 10.94 → 10.33 ms（再 6%）。對 emu 0.78× → 0.82×。
+
+Bank conflict 沒有一次打掉。下一步：下一個質數的 k=0 提前 prefetch，或公平賽 mantissa bits。
+
 ---
 
 ## 什麼叫這輪成功

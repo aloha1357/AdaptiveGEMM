@@ -42,6 +42,11 @@ __device__ __forceinline__ size_t get_B8_offset(int n_idx, int k_idx, int n, int
     return (size_t)(tile_n * num_tiles_k + tile_k) * 2048 + (local_n << 5) + local_k;
 }
 
+// 16-byte XOR inside a 64-wide K row. col is 0 or 16 (one cp.async / ldmatrix chunk).
+__device__ __forceinline__ int swizzle_k16(int row, int col) {
+    return col ^ ((row & 3) << 4);
+}
+
 __device__ __forceinline__ double fp64_hi(double v, int split_bits) {      
     double scale = pow2_int(split_bits);
     double scaled = v * scale;
@@ -779,7 +784,7 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
         (void)mB;
     }
 
-    __shared__ alignas(16) int8_t sa[2][128][48], sb[2][64][48];
+    __shared__ alignas(16) int8_t sa[2][128][64], sb[2][64][64];
     uint64_t final_weighted_sum[2][4][4];
     for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int r = 0; r < 4; r++) final_weighted_sum[i][j][r] = 0;
     
@@ -795,13 +800,15 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
         // Load sa: 128 rows x 32 cols. 256 threads * 16 bytes = 4096 bytes. (128*32 = 4096).
         int m_idx = tid / 2, k_idx = (tid % 2) * 16;
         const int8_t* ptr_A8 = &A8[p * padded_mk + get_A8_offset(rb + m_idx, k_idx, m, k)];
-        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][k_idx], ptr_A8); else *(int4*)&sa[0][m_idx][k_idx] = make_int4(0, 0, 0, 0);
+        int sa_k0 = swizzle_k16(m_idx, k_idx);
+        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][sa_k0], ptr_A8); else *(int4*)&sa[0][m_idx][sa_k0] = make_int4(0, 0, 0, 0);
 
         // Load sb: 64 rows x 32 cols. 128 loads of 16 bytes.
         int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
         const int8_t* ptr_B8 = &B8[p * padded_kn + get_B8_offset(cb + n_idx, kb_idx, n, k)];
+        int sb_k0 = swizzle_k16(n_idx, kb_idx);
         if (tid < 128) {
-            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][kb_idx], ptr_B8); else *(int4*)&sb[0][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
+            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][sb_k0], ptr_B8); else *(int4*)&sb[0][n_idx][sb_k0] = make_int4(0, 0, 0, 0);
         }
         cp_async_commit();
 
@@ -810,9 +817,11 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
             ptr_B8 += 2048;
             int cbuf = (ck / 32) % 2, fbuf = 1 - cbuf;
             if (ck + 32 < k) {
-                if (rb + m_idx < m && ck + 32 + k_idx < k) cp_async_16(&sa[fbuf][m_idx][k_idx], ptr_A8); else *(int4*)&sa[fbuf][m_idx][k_idx] = make_int4(0, 0, 0, 0);
+                int sa_k = swizzle_k16(m_idx, k_idx);
+                int sb_k = swizzle_k16(n_idx, kb_idx);
+                if (rb + m_idx < m && ck + 32 + k_idx < k) cp_async_16(&sa[fbuf][m_idx][sa_k], ptr_A8); else *(int4*)&sa[fbuf][m_idx][sa_k] = make_int4(0, 0, 0, 0);
                 if (tid < 128) {
-                    if (cb + n_idx < n && ck + 32 + kb_idx < k) cp_async_16(&sb[fbuf][n_idx][kb_idx], ptr_B8); else *(int4*)&sb[fbuf][n_idx][kb_idx] = make_int4(0, 0, 0, 0);
+                    if (cb + n_idx < n && ck + 32 + kb_idx < k) cp_async_16(&sb[fbuf][n_idx][sb_k], ptr_B8); else *(int4*)&sb[fbuf][n_idx][sb_k] = make_int4(0, 0, 0, 0);
                 }
                 cp_async_commit(); cp_async_wait_1();
             } else {
@@ -824,7 +833,9 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
                 uint32_t bf[4][2];
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    uint32_t addr_b = __cvta_generic_to_shared(&sb[cbuf][ns + j * 8 + (lane % 8)][(lane / 8 % 2) * 16]);
+                    int b_row = ns + j * 8 + (lane % 8);
+                    int b_col = swizzle_k16(b_row, (lane / 8 % 2) * 16);
+                    uint32_t addr_b = __cvta_generic_to_shared(&sb[cbuf][b_row][b_col]);
                     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];" : "=r"(bf[j][0]), "=r"(bf[j][1]) : "r"(addr_b));
                 }
 
@@ -832,7 +843,7 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
                 for (int i = 0; i < 2; i++) {
                     uint32_t af[4];
                     int a_row = (lane / 8 % 2) * 8 + (lane % 8);
-                    int a_col = (lane / 16) * 16;
+                    int a_col = swizzle_k16(ms + i * 16 + a_row, (lane / 16) * 16);
                     uint32_t addr_a = __cvta_generic_to_shared(&sa[cbuf][ms + i * 16 + a_row][a_col]);
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3]) : "r"(addr_a));
 
