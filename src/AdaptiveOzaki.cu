@@ -84,31 +84,44 @@ AdaptiveOzakiEngine::~AdaptiveOzakiEngine() {
 void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     if (workspace_allocated_) freeWorkspace();
     int nm = (m + 127) / 128, nn = (n + 127) / 128;
-    cudaMalloc(&dmA_h, nm * 8); cudaMalloc(&dmA_l, nm * 8);
-    cudaMalloc(&dmB_h, nn * 8); cudaMalloc(&dmB_l, nn * 8);
-    
+    cudaMalloc(&dmA_h, nm * sizeof(uint64_t)); cudaMalloc(&dmA_l, nm * sizeof(uint64_t));
+    cudaMalloc(&dmB_h, nn * sizeof(uint64_t)); cudaMalloc(&dmB_l, nn * sizeof(uint64_t));
+
     size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
     size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
     cudaMalloc(&dA8_h, 7ULL * padded_mk); cudaMalloc(&dA8_l, 7ULL * padded_mk);
     cudaMalloc(&dB8_h, 7ULL * padded_kn); cudaMalloc(&dB8_l, 7ULL * padded_kn);
-    
-    size_t mk = (size_t)m * k;
-    size_t kn = (size_t)k * n;
-    cudaMalloc(&dA_hi_f32, mk * sizeof(float));
-    cudaMalloc(&dA_low_f32, mk * sizeof(float));
-    cudaMalloc(&dB_hi_f32, kn * sizeof(float));
-    cudaMalloc(&dB_low_f32, kn * sizeof(float));
-    cudaMalloc(&d_global_work_queue, sizeof(int));
 
-    workspace_allocated_ = true;
+    // Split / residual buffers are only used by Phase 23-26 slow paths.
+    const bool need_split =
+        config_.enable_fp64 || config_.enable_residual ||
+        config_.mode == ExecutionMode::Phase26HybridOzaki;
+    if (need_split) {
+        size_t mk = (size_t)m * k;
+        size_t kn = (size_t)k * n;
+        cudaMalloc(&dA_hi_f32, mk * sizeof(float));
+        cudaMalloc(&dA_low_f32, mk * sizeof(float));
+        cudaMalloc(&dB_hi_f32, kn * sizeof(float));
+        cudaMalloc(&dB_low_f32, kn * sizeof(float));
+        cudaMalloc(&dA_hi, mk * sizeof(double));
+        cudaMalloc(&dA_low, mk * sizeof(double));
+        cudaMalloc(&dB_hi, kn * sizeof(double));
+        cudaMalloc(&dB_low, kn * sizeof(double));
+        cudaMalloc(&d_global_work_queue, sizeof(int));
     }
+    ws_m_ = m; ws_n_ = n; ws_k_ = k;
+    workspace_allocated_ = true;
+}
 
-    void AdaptiveOzakiEngine::freeWorkspace() {
+void AdaptiveOzakiEngine::freeWorkspace() {
     if (!workspace_allocated_) return;
     cudaFree(dmA_h); cudaFree(dmA_l); cudaFree(dmB_h); cudaFree(dmB_l);
     cudaFree(dA8_h); cudaFree(dA8_l); cudaFree(dB8_h); cudaFree(dB8_l);
     cudaFree(dA_hi_f32); cudaFree(dA_low_f32); cudaFree(dB_hi_f32); cudaFree(dB_low_f32);
+    cudaFree(dA_hi); cudaFree(dA_low); cudaFree(dB_hi); cudaFree(dB_low);
     cudaFree(d_global_work_queue);
+    dA_hi = dA_low = dB_hi = dB_low = nullptr;
+    ws_m_ = ws_n_ = ws_k_ = 0;
     workspace_allocated_ = false;
 }
 
@@ -180,6 +193,71 @@ __global__ void precompute_modulo_kernel_B(const double* __restrict__ s, int8_t*
             int32_t rem = iv % pr[p];
             if (rem < 0) rem += pr[p];
             d[p * padded_size + out_off] = (int8_t)rem;
+        }
+    }
+}
+
+__global__ void fill_u64_kernel(uint64_t* p, int n, uint64_t v) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = v;
+}
+
+__global__ void precompute_modulo_hl_A(const double* __restrict__ s, int8_t* __restrict__ d_h, int8_t* __restrict__ d_l, int r, int c, double sh, double sl) {
+    int local_k = threadIdx.x;
+    int local_m = threadIdx.y;
+    int tile_k = blockIdx.x;
+    int tile_m = blockIdx.y;
+    const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
+    size_t padded_size = (size_t)((r + 127) / 128) * ((c + 31) / 32) * 4096;
+    int num_tiles_k = (c + 31) / 32;
+    int m_idx = (tile_m / 4) * 128 + (tile_m % 4) * 32 + local_m;
+    int k_idx = tile_k * 32 + local_k;
+    if (m_idx < r && k_idx < c) {
+        double v = s[(size_t)m_idx * c + k_idx];
+        int32_t iv_h = 0, iv_l = 0;
+        if (v != 0.0) {
+            double hs = v * sh;
+            int64_t hi = __double2ll_rn(hs);
+            iv_h = (int32_t)hi;
+            iv_l = __double2int_rn((v - (double)hi / sh) * sl);
+        }
+        size_t out_off = (size_t)((m_idx / 128) * num_tiles_k + tile_k) * 4096 + (m_idx % 128) * 32 + local_k;
+        #pragma unroll
+        for (int p = 0; p < 7; p++) {
+            int32_t rh = iv_h % pr[p]; if (rh < 0) rh += pr[p];
+            int32_t rl = iv_l % pr[p]; if (rl < 0) rl += pr[p];
+            d_h[p * padded_size + out_off] = (int8_t)rh;
+            d_l[p * padded_size + out_off] = (int8_t)rl;
+        }
+    }
+}
+
+__global__ void precompute_modulo_hl_B(const double* __restrict__ s, int8_t* __restrict__ d_h, int8_t* __restrict__ d_l, int r, int c, double sh, double sl) {
+    int local_k = threadIdx.x;
+    int local_n = threadIdx.y;
+    int tile_n = blockIdx.x;
+    int tile_k = blockIdx.y;
+    const int pr[7] = {127, 113, 109, 107, 103, 101, 97};
+    size_t padded_size = (size_t)((c + 63) / 64) * ((r + 31) / 32) * 2048;
+    int num_tiles_k = (r + 31) / 32;
+    int n_idx = (tile_n / 2) * 64 + (tile_n % 2) * 32 + local_n;
+    int k_idx = tile_k * 32 + local_k;
+    if (k_idx < r && n_idx < c) {
+        double v = s[(size_t)k_idx * c + n_idx];
+        int32_t iv_h = 0, iv_l = 0;
+        if (v != 0.0) {
+            double hs = v * sh;
+            int64_t hi = __double2ll_rn(hs);
+            iv_h = (int32_t)hi;
+            iv_l = __double2int_rn((v - (double)hi / sh) * sl);
+        }
+        size_t out_off = (size_t)((n_idx / 64) * num_tiles_k + tile_k) * 2048 + (n_idx % 64) * 32 + local_k;
+        #pragma unroll
+        for (int p = 0; p < 7; p++) {
+            int32_t rh = iv_h % pr[p]; if (rh < 0) rh += pr[p];
+            int32_t rl = iv_l % pr[p]; if (rl < 0) rl += pr[p];
+            d_h[p * padded_size + out_off] = (int8_t)rh;
+            d_l[p * padded_size + out_off] = (int8_t)rl;
         }
     }
 }
@@ -630,9 +708,31 @@ void AdaptiveOzakiEngine::profileHardwareRatio() {
 }
 
 __constant__ int d_primes[7] = {127, 113, 109, 107, 103, 101, 97};
+__constant__ uint32_t d_prime_magic[7] = {
+    33818641u, 38008561u, 39403370u, 40139882u, 41698712u, 42524429u, 44278014u
+};
 __constant__ uint64_t d_M_arr[8] = {0ULL, 127ULL, 14351ULL, 1564259ULL, 167375713ULL, 17239698439ULL, 1741209542339ULL, 168897325606883ULL};
 __constant__ uint64_t d_coeffs_flat[29] = {0, 1, 1017, 13335, 775971, 27686, 760603, 71167626, 111090075, 42995596, 109498130, 12624346101, 7475621447, 10755041228, 5800272372, 15063814170, 1357320824343, 662584162129, 734822375666, 1643571624077, 980486926754, 1586052256388, 147618922380819, 112099994871825, 134807957135769, 34726552928518, 96747011755399, 130435558389474, 19153304965729};
 __constant__ int d_coeff_offsets[8] = {0, 1, 2, 4, 7, 11, 16, 22};
+
+// x in [0, 126*126*2048]. magic = floor(2^32 / p) + 1.
+__device__ __forceinline__ uint32_t rem_prime_u32(uint32_t x, int pidx) {
+    uint32_t p = (uint32_t)d_primes[pidx];
+    uint32_t q = __umulhi(x, d_prime_magic[pidx]);
+    uint32_t r = x - q * p;
+    if (r >= p) r -= p;
+    return r;
+}
+
+// Only valid for the 7-prime modulus M = 168897325606883. x < 127 * M.
+__device__ __forceinline__ uint64_t barrett_mod_M7(uint64_t x) {
+    const uint64_t M = 168897325606883ULL;
+    const uint64_t mu = 109218ULL;
+    uint64_t q = __umul64hi(x, mu);
+    uint64_t r = x - q * M;
+    if (r >= M) r -= M;
+    return r;
+}
 
 struct KernelHeteroConfig {
     int enable_fp64;
@@ -645,31 +745,39 @@ struct KernelHeteroConfig {
     int warp_residual;
 };
 
+template<bool kAtomic, bool kDynamicNL>
 __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, double* __restrict__ C, const uint64_t* mA, const uint64_t* mB, int m, int n, int k, double inv, KernelHeteroConfig cfg) {
     int rb = blockIdx.y * 128, cb = blockIdx.x * 64, tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
-    int wm = wid / 2, wn = wid % 2, ms = wm * 32, ns = (wid % 2) * 32;
-    uint64_t bma = mA[blockIdx.y], bmb = mB[blockIdx.x / 2], M = 0; int nl = 0;
+    int wm = wid / 2, ms = wm * 32, ns = (wid % 2) * 32;
+    uint64_t M = 0; int nl = 7;
     int tc_begin = cfg.warp_fp64;
     int tc_end = cfg.warp_fp64 + cfg.warp_tc;
     bool tc_active = (cfg.warp_tc <= 0) ? true : (wid >= tc_begin && wid < tc_end);
-    if (bma > 0 && bmb > 0) {
-        uint64_t th = (uint64_t)k * bma * bmb;
-        if (th < 127ULL) nl = 1; else if (th < 14351ULL) nl = 2; else if (th < 1564259ULL) nl = 3; else if (th < 167375713ULL) nl = 4; else if (th < 17239698439ULL) nl = 5; else if (th < 1741209542339ULL) nl = 6; else nl = 7;
-    }
-    bool cap_tc_bits = ((cfg.enable_fp64 && cfg.warp_fp64 > 0) || (cfg.enable_residual && cfg.warp_residual > 0));
-    if (cap_tc_bits && cfg.split_tc_bits > 0) {
-        double target = pow2_int(cfg.split_tc_bits);
-        int nl_cap = 0;
-        for (int i = 1; i <= 7; ++i) {
-            if (static_cast<double>(d_M_arr[i]) >= target) {
-                nl_cap = i;
-                break;
-            }
+    if constexpr (kDynamicNL) {
+        nl = 0;
+        uint64_t bma = mA[blockIdx.y], bmb = mB[blockIdx.x / 2];
+        if (bma > 0 && bmb > 0) {
+            uint64_t th = (uint64_t)k * bma * bmb;
+            if (th < 127ULL) nl = 1; else if (th < 14351ULL) nl = 2; else if (th < 1564259ULL) nl = 3; else if (th < 167375713ULL) nl = 4; else if (th < 17239698439ULL) nl = 5; else if (th < 1741209542339ULL) nl = 6; else nl = 7;
         }
-        if (nl_cap == 0) nl_cap = 7;
-        if (nl > nl_cap) nl = nl_cap;
+        bool cap_tc_bits = ((cfg.enable_fp64 && cfg.warp_fp64 > 0) || (cfg.enable_residual && cfg.warp_residual > 0));
+        if (cap_tc_bits && cfg.split_tc_bits > 0) {
+            double target = pow2_int(cfg.split_tc_bits);
+            int nl_cap = 0;
+            for (int i = 1; i <= 7; ++i) {
+                if (static_cast<double>(d_M_arr[i]) >= target) {
+                    nl_cap = i;
+                    break;
+                }
+            }
+            if (nl_cap == 0) nl_cap = 7;
+            if (nl > nl_cap) nl = nl_cap;
+        }
+        if (nl == 0) return;
+    } else {
+        (void)mA;
+        (void)mB;
     }
-    if (nl == 0) return;
 
     __shared__ alignas(16) int8_t sa[2][128][48], sb[2][64][48];
     uint64_t final_weighted_sum[2][4][4];
@@ -741,9 +849,22 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
         __syncthreads();
         uint64_t cp = d_coeffs_flat[off + p];
         if (tc_active) {
-            for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int r = 0; r < 4; r++) {
-                int32_t v = cf[i][j][r] % d_primes[p]; if (v < 0) v += d_primes[p];
-                final_weighted_sum[i][j][r] = (final_weighted_sum[i][j][r] + ((uint64_t)v * cp) % M) % M;
+            #pragma unroll
+            for (int i = 0; i < 2; i++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if constexpr (!kDynamicNL) {
+                    uint32_t v = rem_prime_u32((uint32_t)cf[i][j][r], p);
+                    uint64_t t = barrett_mod_M7((uint64_t)v * cp);
+                    uint64_t s = final_weighted_sum[i][j][r] + t;
+                    if (s >= M) s -= M;
+                    final_weighted_sum[i][j][r] = s;
+                } else {
+                    int32_t v = cf[i][j][r] % d_primes[p]; if (v < 0) v += d_primes[p];
+                    final_weighted_sum[i][j][r] = (final_weighted_sum[i][j][r] + ((uint64_t)v * cp) % M) % M;
+                }
             }
         }
     }
@@ -756,7 +877,11 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
             if (gm < m && gn < n) {
                 uint64_t cv = final_weighted_sum[i][j][r] % M;
                 double fv = (cv > M / 2) ? (double)((int64_t)cv - (int64_t)M) : (double)cv;
-                atomicAdd(&C[(size_t)gm * n + gn], fv * inv);
+                if constexpr (kAtomic) {
+                    atomicAdd(&C[(size_t)gm * n + gn], fv * inv);
+                } else {
+                    C[(size_t)gm * n + gn] += fv * inv;
+                }
             }
         }
     }
@@ -773,12 +898,26 @@ void decoupled_crt_pass_kernel(const int8_t* __restrict__ A8, const int8_t* __re
     cfg.warp_fp64 = 0;
     cfg.warp_tc = 0;
     cfg.warp_residual = 0;
-    crt_pass_kernel_body(A8, B8, C, mA, mB, m, n, k, inv, cfg);
+    crt_pass_kernel_body<true, true>(A8, B8, C, mA, mB, m, n, k, inv, cfg);
+}
+
+__global__ __launch_bounds__(256, 3)
+void crt_fast_kernel(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, double* __restrict__ C, int m, int n, int k, double inv) {
+    KernelHeteroConfig cfg;
+    cfg.enable_fp64 = 0;
+    cfg.enable_residual = 0;
+    cfg.split_fp64_bits = 0;
+    cfg.split_tc_bits = 0;
+    cfg.split_residual_bits = 0;
+    cfg.warp_fp64 = 0;
+    cfg.warp_tc = 0;
+    cfg.warp_residual = 0;
+    crt_pass_kernel_body<false, false>(A8, B8, C, nullptr, nullptr, m, n, k, inv, cfg);
 }
 
 __global__ __launch_bounds__(256, 2)
 void hetero_crt_pass_kernel(const int8_t* __restrict__ A8, const int8_t* __restrict__ B8, const double* __restrict__ A, const double* __restrict__ B, double* __restrict__ C, const uint64_t* mA, const uint64_t* mB, int m, int n, int k, double inv, KernelHeteroConfig cfg, int pass, int fp64_kernel, int split_bits) {
-    crt_pass_kernel_body(A8, B8, C, mA, mB, m, n, k, inv, cfg);
+    crt_pass_kernel_body<true, true>(A8, B8, C, mA, mB, m, n, k, inv, cfg);
     if (fp64_kernel && pass == 0) {
         int rb = blockIdx.y * 128, cb = blockIdx.x * 64; // Note cb is * 64 now (since C tile is 128x64) Wait! In hetero_crt_pass_kernel it was cb = blockIdx.x * 128. Let me fix the grid.
         int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
@@ -1121,9 +1260,72 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         cudaStreamSynchronize(st); cudaStreamDestroy(st);
         return;
     }
-    profileHardwareRatio();
-    
+
+    if (!workspace_allocated_ || ws_m_ != m || ws_n_ != n || ws_k_ != k) {
+        allocateWorkspace(m, n, k);
+    }
+
     OzakiConfig local_cfg = config_;
+    bool is_phase24 = (local_cfg.mode == ExecutionMode::Phase24ExtremeMix);
+    bool do_fp64 = ((local_cfg.mode == ExecutionMode::Phase23Hetero || is_phase24) && local_cfg.enable_fp64);
+    bool do_residual = ((local_cfg.mode == ExecutionMode::Phase23Hetero || is_phase24) && local_cfg.enable_residual);
+
+    // Fast path: INT8 CRT only. No naive FP64 GEMM, no per-call malloc, no slice-max scan.
+    if (!do_fp64 && !do_residual) {
+        double sh = ldexp(1.0, 17), sl = ldexp(1.0, 34);
+        int nm = (m + 127) / 128;
+        int nn_tc = (n + 63) / 64;
+        dim3 pre_block(32, 32);
+        dim3 pre_grid_A((k + 31) / 32, ((m + 127) / 128) * 4);
+        dim3 pre_grid_B(((n + 63) / 64) * 2, (k + 31) / 32);
+
+        // Zero on the default stream so it waits for the previous CRT launch
+        // and the next CRT launch waits for this memset.
+        cudaMemsetAsync(dC, 0, (size_t)m * n * sizeof(double), 0);
+
+        static cudaStream_t stream_a = nullptr, stream_b = nullptr;
+        if (!stream_a) {
+            cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+            cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+        }
+        static bool printed_break = false;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr;
+        if (!printed_break) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+            cudaEventCreate(&ev2);
+            cudaEventRecord(ev0);
+        }
+        precompute_modulo_hl_A<<<pre_grid_A, pre_block, 0, stream_a>>>(dA, dA8_h, dA8_l, m, k, sh, sl);
+        precompute_modulo_hl_B<<<pre_grid_B, pre_block, 0, stream_b>>>(dB, dB8_h, dB8_l, k, n, sh, sl);
+        cudaStreamSynchronize(stream_a);
+        cudaStreamSynchronize(stream_b);
+        if (!printed_break) cudaEventRecord(ev1);
+
+        int8_t *A8_ptrs[2] = {dA8_h, dA8_l}, *B8_ptrs[2] = {dB8_h, dB8_l};
+        int mA_map[4] = {0, 0, 1, 1}, mB_map[4] = {0, 1, 0, 1};
+        double inv[4] = {ldexp(1.0, -34), ldexp(1.0, -51), ldexp(1.0, -51), ldexp(1.0, -68)};
+        for (int pass = 0; pass < 4; pass++) {
+            crt_fast_kernel<<<dim3(nn_tc, nm), 256>>>(
+                A8_ptrs[mA_map[pass]], B8_ptrs[mB_map[pass]], dC, m, n, k, inv[pass]);
+        }
+        if (!printed_break) {
+            cudaEventRecord(ev2);
+            cudaEventSynchronize(ev2);
+            float pack_ms = 0.f, crt_ms = 0.f;
+            cudaEventElapsedTime(&pack_ms, ev0, ev1);
+            cudaEventElapsedTime(&crt_ms, ev1, ev2);
+            std::cout << "[Phase22] pack " << pack_ms << " ms  crt " << crt_ms
+                      << " ms  total " << (pack_ms + crt_ms) << " ms\n";
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            cudaEventDestroy(ev2);
+            printed_break = true;
+        }
+        return;
+    }
+
+    profileHardwareRatio();
     int max_fp64_cells = (int)(8192.0 / 7.0 * ratio_fp64_tc);
     bool do_fp64_kernel = (local_cfg.mode == ExecutionMode::Phase23Hetero && local_cfg.enable_fp64 && local_cfg.enable_kernel_fp64);
     
@@ -1140,9 +1342,6 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         do_fp64_kernel = false;
     }
 
-    bool local_alloc = false;
-    if (!workspace_allocated_) { allocateWorkspace(m, n, k); local_alloc = true; }
-
     cudaMemset(dC, 0, (size_t)m * n * 8);
     double sh = pow(2.0, 17.0), sl = pow(2.0, 34.0);
     int nm = (m + 127) / 128;
@@ -1151,15 +1350,7 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
 
     const double* A_tc = dA;
     const double* B_tc = dB;
-    double* dA_hi = nullptr;
-    double* dA_low = nullptr;
-    double* dB_hi = nullptr;
-    double* dB_low = nullptr;
-
-    bool is_phase24 = (local_cfg.mode == ExecutionMode::Phase24ExtremeMix);
-    bool do_fp64 = ((local_cfg.mode == ExecutionMode::Phase23Hetero || is_phase24) && local_cfg.enable_fp64);
     if (local_cfg.mode == ExecutionMode::Phase23Hetero && !local_cfg.enable_kernel_fp64 && config_.enable_fp64) do_fp64 = true;
-    bool do_residual = ((local_cfg.mode == ExecutionMode::Phase23Hetero || is_phase24) && local_cfg.enable_residual);
     bool do_cross_terms = do_fp64 && !do_residual;
 
     // Stream Setup
@@ -1184,10 +1375,10 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
     if (do_fp64) {
         size_t mk = (size_t)m * k;
         size_t kn = (size_t)k * n;
-        cudaMalloc(&dA_hi, mk * sizeof(double));
-        cudaMalloc(&dA_low, mk * sizeof(double));
-        cudaMalloc(&dB_hi, kn * sizeof(double));
-        cudaMalloc(&dB_low, kn * sizeof(double));
+        if (!dA_hi) cudaMalloc(&dA_hi, mk * sizeof(double));
+        if (!dA_low) cudaMalloc(&dA_low, mk * sizeof(double));
+        if (!dB_hi) cudaMalloc(&dB_hi, kn * sizeof(double));
+        if (!dB_low) cudaMalloc(&dB_low, kn * sizeof(double));
         int threads = 256;
         int blocks_a = (int)((mk + threads - 1) / threads);
         int blocks_b = (int)((kn + threads - 1) / threads);
@@ -1298,12 +1489,6 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         }
     }
 
-    if (dA_hi) cudaFree(dA_hi);
-    if (dA_low) cudaFree(dA_low);
-    if (dB_hi) cudaFree(dB_hi);
-    if (dB_low) cudaFree(dB_low);
-
-    if (local_alloc) freeWorkspace();
 }
 
 void AdaptiveOzakiEngine::bitShiftToINT8(const double* d_src, int8_t* d_dst, int count, int shift) {

@@ -6,9 +6,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <vector>
+
+#ifdef _WIN32
+#include <stdlib.h>
+#endif
 
 using namespace ozaki;
 
@@ -47,9 +52,23 @@ static double max_error(const std::vector<double>& reference, const std::vector<
     return result;
 }
 
+static double time_ms(int runs, const std::function<void()>& fn) {
+    for (int i = 0; i < 2; ++i) fn();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < runs; ++i) fn();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count() / runs;
+}
+
 int main() {
     const int n = 2048;
     const int element_count = n * n;
+    const int runs = 5;
+
+    cudaDeviceProp prop{};
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
     std::vector<double> h_A(element_count);
     std::vector<double> h_B(element_count);
@@ -71,44 +90,95 @@ int main() {
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), element_count * sizeof(double), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_C, 0, element_count * sizeof(double)));
 
-    cublasHandle_t handle;
-    CHECK_CUBLAS(cublasCreate(&handle));
+    // Do not let an inherited env var silently turn native DGEMM into emulation.
+    _putenv("CUBLAS_EMULATE_DOUBLE_PRECISION=");
+
+    cublasHandle_t handle_native;
+    cublasHandle_t handle_emu;
+    CHECK_CUBLAS(cublasCreate(&handle_native));
+    CHECK_CUBLAS(cublasCreate(&handle_emu));
+
+    const size_t ws_bytes = 1024ull * 1024ull * 1024ull;
+    void* emu_ws = nullptr;
+    CHECK_CUDA(cudaMalloc(&emu_ws, ws_bytes));
+    CHECK_CUBLAS(cublasSetWorkspace(handle_emu, emu_ws, ws_bytes));
+    CHECK_CUBLAS(cublasSetEmulationStrategy(handle_emu, CUBLAS_EMULATION_STRATEGY_EAGER));
+    CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(
+        handle_emu, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC));
 
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    CHECK_CUBLAS(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, d_A, n, d_B, n, &beta, d_C, n));
-    CHECK_CUDA(cudaMemcpy(h_C_reference.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+    auto cublas_rowmajor_ab = [&](cublasHandle_t h, cublasComputeType_t compute) {
+        CHECK_CUBLAS(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, d_B, CUDA_R_64F, n,
+                                  d_A, CUDA_R_64F, n, &beta, d_C, CUDA_R_64F, n, compute,
+                                  CUBLAS_GEMM_DEFAULT));
+    };
 
-    CHECK_CUDA(cudaMemset(d_C, 0, element_count * sizeof(double)));
+    // Row-major C=A*B is column-major C=B*A with the same pointers.
+    const double native_ms =
+        time_ms(runs, [&]() { cublas_rowmajor_ab(handle_native, CUBLAS_COMPUTE_64F); });
+    CHECK_CUDA(cudaMemcpy(h_C_reference.data(), d_C, element_count * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+
+    std::vector<double> h_C_emu(element_count, 0.0);
+    const double emu_ms = time_ms(
+        runs, [&]() { cublas_rowmajor_ab(handle_emu, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT); });
+    CHECK_CUDA(cudaMemcpy(h_C_emu.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
 
     OzakiConfig config;
-    config.mode = ExecutionMode::Phase24ExtremeMix;
+    config.mode = ExecutionMode::Phase22;
+    config.enable_fp64 = false;
+    config.enable_residual = false;
     AdaptiveOzakiEngine engine(config);
 
-    engine.execute(d_A, d_B, d_C, n, n, n);
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    const int runs = 3;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < runs; ++i) {
-        engine.execute(d_A, d_B, d_C, n, n, n);
-    }
-    CHECK_CUDA(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    const double avg_ms = std::chrono::duration<double, std::milli>(end - start).count() / runs;
-    const double gflops = (2.0 * n * n * n) / (avg_ms * 1e-3) / 1e9;
-
+    const double adaptive_ms = time_ms(runs, [&]() { engine.execute(d_A, d_B, d_C, n, n, n); });
     CHECK_CUDA(cudaMemcpy(h_C_result.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
 
-    std::cout << "AdaptiveOzaki demo\n";
-    std::cout << "Matrix size: " << n << " x " << n << "\n";
-    std::cout << "Average time: " << avg_ms << " ms\n";
-    std::cout << "Throughput: " << gflops << " GFLOPS\n";
-    std::cout << "Max error vs cuBLAS FP64: " << max_error(h_C_reference, h_C_result) << '\n';
+    const double flop = 2.0 * n * n * n;
+    auto gflops = [&](double ms) { return flop / (ms * 1e-3) / 1e9; };
 
-    CHECK_CUBLAS(cublasDestroy(handle));
+    std::cout << "2048^3 GEMM  native vs cuBLAS Ozaki emu vs Phase22\n";
+    std::cout << "GPU: " << prop.name << "  SM " << prop.major << "." << prop.minor << "\n";
+    std::cout << "CUDA runtime: " << CUDART_VERSION << "\n\n";
+    std::cout << "cuBLAS native DGEMM:     " << native_ms << " ms  (" << gflops(native_ms)
+              << " GFLOPS)\n";
+    std::cout << "cuBLAS FP64 emu (Ozaki): " << emu_ms << " ms  (" << gflops(emu_ms) << " GFLOPS)  "
+              << (native_ms / emu_ms) << "x vs native  err " << max_error(h_C_reference, h_C_emu)
+              << "\n";
+    std::cout << "Adaptive Phase22:        " << adaptive_ms << " ms  (" << gflops(adaptive_ms)
+              << " GFLOPS)  " << (native_ms / adaptive_ms) << "x vs native  err "
+              << max_error(h_C_reference, h_C_result) << "\n";
+    std::cout << "Phase22 vs cuBLAS emu:   " << (emu_ms / adaptive_ms) << "x ( >1 means Phase22 faster )\n";
+
+    double cpu = 0.0;
+    for (int kk = 0; kk < n; ++kk) cpu += h_A[0 * n + kk] * h_B[kk * n + 0];
+    std::cout << "C[0,0] adaptive=" << h_C_result[0] << "  cpu=" << cpu
+              << "  cublas=" << h_C_reference[0] << "  |err|="
+              << std::abs(h_C_result[0] - cpu) << '\n';
+    const int mid = n / 2;
+    cpu = 0.0;
+    for (int kk = 0; kk < n; ++kk) cpu += h_A[mid * n + kk] * h_B[kk * n + mid];
+    std::cout << "C[mid,mid] adaptive=" << h_C_result[mid * n + mid] << "  cpu=" << cpu
+              << "  cublas=" << h_C_reference[mid * n + mid] << "  |err|="
+              << std::abs(h_C_result[mid * n + mid] - cpu) << '\n';
+
+    size_t worst = 0;
+    double worst_err = 0.0;
+    for (size_t i = 0; i < h_C_reference.size(); ++i) {
+        double e = std::abs(h_C_reference[i] - h_C_result[i]);
+        if (e > worst_err) {
+            worst_err = e;
+            worst = i;
+        }
+    }
+    int wr = (int)(worst / n), wc = (int)(worst % n);
+    std::cout << "worst err " << worst_err << " at (" << wr << "," << wc
+              << ") adaptive=" << h_C_result[worst] << " cublas=" << h_C_reference[worst] << '\n';
+
+    CHECK_CUBLAS(cublasDestroy(handle_native));
+    CHECK_CUBLAS(cublasDestroy(handle_emu));
+    CHECK_CUDA(cudaFree(emu_ws));
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));

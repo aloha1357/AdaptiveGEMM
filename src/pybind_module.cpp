@@ -48,11 +48,21 @@ static py::array_t<double> gemm_ref(py::array_t<double> a, py::array_t<double> b
     return c;
 }
 
+static ExecutionMode parse_mode(const std::string& mode) {
+    if (mode == "phase22" || mode == "Phase22") return ExecutionMode::Phase22;
+    if (mode == "phase23" || mode == "Phase23Hetero") return ExecutionMode::Phase23Hetero;
+    if (mode == "phase24" || mode == "Phase24ExtremeMix") return ExecutionMode::Phase24ExtremeMix;
+    if (mode == "phase25" || mode == "Phase25Stacking") return ExecutionMode::Phase25Stacking;
+    if (mode == "phase26" || mode == "Phase26HybridOzaki") return ExecutionMode::Phase26HybridOzaki;
+    throw std::runtime_error("Unknown mode '" + mode + "'. Use phase22 (default).");
+}
+
 class AdaptiveGEMMWrapper {
 public:
-    AdaptiveGEMMWrapper() {
-        // Default configuration
-        config_.mode = ExecutionMode::Phase22; 
+    explicit AdaptiveGEMMWrapper(const std::string& mode = "phase22") {
+        config_.mode = parse_mode(mode);
+        config_.enable_fp64 = false;
+        config_.enable_residual = false;
     }
 
     py::array_t<double> gemm(py::array_t<double> a, py::array_t<double> b) {
@@ -121,6 +131,8 @@ PYBIND11_MODULE(adaptive_gemm_py, m) {
     m.def("gemm_ref", &gemm_ref, "Compute reference GEMM on CPU", py::arg("A"), py::arg("B"));
 
     py::class_<AdaptiveGEMMWrapper>(m, "AdaptiveGEMM")
-        .def(py::init<>())
+        .def(py::init<const std::string&>(),
+             py::arg("mode") = "phase22",
+             "Create an engine. Default mode is phase22 (INT8 CRT only). Do not use phase24 unless you want the slow residual path.")
         .def("gemm", &AdaptiveGEMMWrapper::gemm, "Compute GEMM on GPU using AdaptiveOzakiEngine", py::arg("A"), py::arg("B"));
 }

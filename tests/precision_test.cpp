@@ -76,7 +76,8 @@ int main() {
 
     const double alpha = 1.0;
     const double beta = 0.0;
-    CHECK_CUBLAS(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, d_A, n, d_B, n, &beta, d_C, n));
+    // Row-major C=A*B is column-major C=B*A with the same pointers.
+    CHECK_CUBLAS(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, d_B, n, d_A, n, &beta, d_C, n));
     CHECK_CUDA(cudaMemcpy(h_reference.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
 
     CHECK_CUDA(cudaMemset(d_C, 0, element_count * sizeof(double)));

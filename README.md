@@ -1,13 +1,19 @@
-# AdaptiveGEMM: FP64-Precision GEMM via INT8 Tensor Cores on Consumer Ada GPUs
+# AdaptiveGEMM: Ozaki GEMM on INT8 Tensor Cores
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/std/the-standard)
 [![CMake](https://img.shields.io/badge/CMake-3.18%2B-064F8C.svg)](https://cmake.org/)
 [![CI](https://img.shields.io/badge/GitHub_Actions-enabled-2088FF.svg)](.github/workflows/ci.yml)
 
-> **Achieves ~67 TOPS effective INT8 throughput (28% peak Tensor Core) on RTX 4060,  
-> delivering FP64-equivalent precision via Ozaki Scheme + CRT/RNS reconstruction.**
+Consumer Ada GPUs throttle native FP64. AdaptiveGEMM maps a 2-slice Ozaki +
+7-prime CRT GEMM onto INT8 Tensor Cores. On an RTX 4060 Laptop it is **faster
+than native `cublasDgemm`**, and **slower and less accurate than cuBLAS 13
+FP64 emulation**.
+
+This is not full FP64. Default Phase 22 keeps max error vs native DGEMM around
+`3e-9` on 2048³ `U(-1,1)` inputs — better than FP32, not a drop-in for
+`cublasDgemm` ulp.
 
 **English** | [**中文**](#中文版)
 
@@ -15,85 +21,76 @@
 
 ## Why This Exists
 
-Consumer GPUs like the RTX 4060 have their FP64 throughput artificially throttled
-to protect data-center GPU sales — a 64:1 ratio between FP32 and FP64 peak performance.
-Yet the same card has massive INT8 Tensor Core throughput sitting largely unused
-for scientific workloads.
+Ada consumer cards have no FP64 Tensor Cores. Native DGEMM runs on throttled
+CUDA cores. The same SM has unused INT8 Tensor Core throughput, which is the
+Ozaki / CRT idea: split the FP64 inputs, multiply in INT8, reconstruct.
 
-| Hardware Path    | RTX 4060 (Ada)  | RTX A100        |
-|------------------|-----------------|-----------------|
-| FP64 CUDA Core   | ~3.8 GFLOPS     | ~9.7 TFLOPS     |
-| FP32 CUDA Core   | ~242 GFLOPS     | ~312 TFLOPS     |
-| INT8 Tensor Core | ~242 TOPS       | ~624 TOPS       |
+CUDA 13 cuBLAS already ships the production version of that idea
+(`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`). This repo is a from-scratch Ada
+implementation for reading, profiling, and writing about the kernels — not a
+faster library than NVIDIA's.
 
-AdaptiveGEMM bridges this gap: it maps FP64 precision requirements onto
-INT8 Tensor Core throughput via the Ozaki Scheme, making consumer GPUs
-viable for scientific and quantitative workloads that normally require
-A100-class hardware.
+| Path | RTX 4060 Laptop (measured, 2048³) |
+|------|-----------------------------------|
+| Native cuBLAS DGEMM | 82.2 ms / 209 GFLOPS |
+| AdaptiveGEMM Phase 22 | 13.6 ms / 1262 GFLOPS |
+| cuBLAS 13 Ozaki emu | 8.5 ms / 2014 GFLOPS |
+
+A100 numbers do not belong in this table. We did not re-bench A100.
 
 ---
 
 ## Performance
 
-> Profiled on **RTX 4060 (Ada Lovelace, 24 SM, 2.11 GHz SM / 7.99 GHz DRAM)**
-> using NVIDIA Nsight Compute. Optimized in Phase 28 via Tiled Layout and Register Spilling.
+Measured 2026-08 on **RTX 4060 Laptop (Ada, SM 8.9, CUDA 13.0)**, 2048³,
+`U(-1,1)` float64, vs row-major-equivalent native `cublasGemmEx(COMPUTE_64F)`.
 
-### Throughput (2048 x 2048 Matrix)
+| Implementation | Time | Throughput | vs native | Max error vs native FP64 |
+|----------------|------|------------|-----------|--------------------------|
+| cuBLAS native DGEMM | 82.2 ms | 209 GFLOPS | 1.0× | — |
+| **AdaptiveGEMM Phase 22 (INT8 CRT)** | **13.6 ms** | **1262 GFLOPS** | **6.0×** | **3.40e-9** |
+| cuBLAS 13 Ozaki emu (`COMPUTE_64F_EMULATED_FIXEDPOINT`) | 8.5 ms | 2014 GFLOPS | 9.6× | 2.84e-13 |
+| Old Phase 24 ExtremeMix (default before this fix) | ~130 ms | ~132 GFLOPS | 0.6× | 3.55e-15 |
 
-| Execution Mode | Average Time | Throughput | Max Error vs cuBLAS FP64 |
-|----------------|--------------|------------|--------------------------|
-| **Phase 24 (ExtremeMix)** | ~128 ms | **~133 GFLOPS** | 3.55271e-15 |
+Phase 22 vs cuBLAS emu: **about 1.6× slower**, error worse by ~4 orders of
+magnitude. NVIDIA wins on this card.
 
-### Key Optimizations & Occupancy
+The old Phase 24 1e-15 figure was not Ozaki reaching FP64. That path launched a
+naive residual FP64 GEMM after the INT8 CRT and effectively recomputed `C`.
+It was slower than native DGEMM. Do not use it as the headline number.
 
-* **Block-Tiled Memory Layout:** Coalesced global memory access via 128x32/64x32 tiles resolved the uncoalesced memory bottleneck, reducing precompute layout transformation overhead from 50ms to ~9ms.
-* **Occupancy Breakthrough:** The main `decoupled_crt_pass_kernel` achieved **50%-60% SM Occupancy** (up from the previous 33.33% ceiling). This was achieved by applying `__launch_bounds__(256, 3)` and performing variable life-cycle analysis to allow targeted L1 register spilling.
-* **Sliding Pointers:** Replaced ALU-heavy modulo indexing in the critical inner loops with sliding pointer offsets, significantly reducing execution latency.
+Demo default is Phase 22 (`enable_fp64 = false`, `enable_residual = false`).
 
-### Pipeline Utilization & Profiler Notes (Phase 28)
+### What the NCU notes actually measured
 
-The kernel effectively drives heterogeneous compute pipelines, with the heavy lifting offloaded to Tensor Cores. Based on the latest **Nsight Compute (ncu)** analysis of `decoupled_crt_pass_kernel`:
+Earlier Nsight Compute numbers (`decoupled_crt_pass_kernel` occupancy ~48%,
+INT8 tensor pipe ~36%, precompute tiled-layout fix 50 ms → ~9 ms) describe
+**the CRT kernel**, not the 130 ms Phase 24 wall time. Residual / naive FP64
+GEMMs dominated that end-to-end number.
 
-| Pipeline | Active Cycle Utilization | Role in AdaptiveOzaki |
-|----------|--------------------------|-----------------------|
-| **Tensor (INT8)** | **36.5%** | Primary CRT residue matrix multiplication. Explicitly captured in the Tensor Core Roofline chart. |
-| **ALU / FMA** | **~23.0%** | Reconstruction math and sliding pointer logic. |
-| **FP64** | **~25.0%** | Final scaling and bias adjustment (largely bypassed). |
-
-**Roofline Status:** The kernel is currently balanced at the intersection of Memory-Bound and Compute-Bound regions. Memory throughput has reached **70.54%** of theoretical peak, while achieved occupancy has improved to **48.10%**. The latest profiling includes a hierarchical Tensor Core Roofline analysis.
-
-<!-- Insert Nsight Compute screenshots below -->
 ![Speed of Light](docs/profile_sol.png)
 ![Pipe Utilization](docs/profile_pipe.png)
-
-### Current Known Bottlenecks
-
-Based on the latest `ncu` reporting:
-* The `add_residual_kernel` now registers >90% Memory Throughput, indicating it has become a pure memory-bound kernel. Future optimizations will focus on fusing this addition step directly into the decoupled CRT pass to save a massive global memory write/read cycle.
 
 ---
 
 ## Accuracy
 
-After resolving precision overflow and data-race conditions in earlier iterations,
-we validated accuracy across matrix scales up to 4096×4096:
+Phase 22 uses a **17-bit high + 17-bit low** split (about 34 mantissa bits)
+and 7 primes `{127, 113, 109, 107, 103, 101, 97}`. That is why the error sits
+near `1e-9`, not `1e-15`.
 
-| Matrix Size | Avg Absolute Error | Max Absolute Error | Errors > 0.1 |
-|-------------|-------------------|-------------------|--------------|
-| 1024 × 1024 | < 2.50e-10        | < 2.00e-09        | **0%**       |
-| 2048 × 2048 | 4.958e-10         | 3.110e-09         | **0%**       |
-| 4096 × 4096 | 7.006e-10         | 4.575e-09         | **0%**       |
+| Matrix | Max abs error vs native FP64 | Notes |
+|--------|------------------------------|-------|
+| 512² | 1.5e-9 | `precision_test` (tolerance 1e-8) |
+| 2048³ | 3.40e-9 | same seed / demo as the table above |
+| 2048³ cuBLAS emu | 2.84e-13 | NVIDIA dynamic mantissa control |
 
-> **Key result:** Even at K=4096 (deep accumulation), max error remains bounded
-> at O(10⁻⁹) — equivalent to lossless double-precision arithmetic.
-> This confirms the 7-prime CRT architecture successfully maps FP64-precision
-> computation onto INT8 Tensor Core hardware without numerical degradation.
+`O(10^-9)` is **not** lossless double precision. Native FP64 GEMM error on
+this size is ~`1e-15`. cuBLAS emu stays within ~`3e-13` of native. Phase 22
+does not.
 
-> **Stability:** Error growth from N=1024 to N=4096 is sub-linear (~2.3×)
-> despite a 16× increase in accumulation depth, demonstrating stable numerical
-> behavior of the 7-prime CRT reconstruction scheme.
-
-*Tested with random uniform [0, 1] float64 inputs. Reference: NumPy `A @ B`.*
+Ill-conditioned inputs or values spanning many orders of magnitude need more
+slices (and will cost more CRT passes).
 
 ---
 
@@ -101,128 +98,120 @@ we validated accuracy across matrix scales up to 4096×4096:
 
 ### Algorithm: Ozaki Scheme + CRT/RNS Reconstruction
 
-The core idea: instead of computing `C = A × B` in FP64 directly,
-decompose the problem into multiple INT8-compatible sub-problems.
+Instead of `C = A × B` in FP64 CUDA cores, split each input, map to INT8
+residues, multiply on Tensor Cores, reconstruct.
 
-**Step 1 — Split:** Each FP64 matrix is split into high and low parts:
+**Split (Phase 22):**
 ```
-A = A_hi + A_lo    (bit-level split via fp64_hi())
-B = B_hi + B_lo
-```
-
-**Step 2 — Residue Mapping:** Each part is mapped to INT8 residues
-modulo 7 co-prime primes `{127, 113, 109, 107, 103, 101, 97}`:
-```
-A_int8[p] = round(A * scale) mod prime[p]    for p = 0..6
-B_int8[p] = round(B * scale) mod prime[p]    for p = 0..6
+A ≈ A_hi * 2^{-17} + A_lo * 2^{-34}
 ```
 
-**Step 3 — INT8 GEMM:** Each residue pair is multiplied via INT8 Tensor Cores:
+**Residue mapping** modulo `{127, 113, 109, 107, 103, 101, 97}`:
 ```
-C_int32[p] = A_int8[p] × B_int8[p]    (via PTX mma.sync.m16n8k32.s8)
-```
-
-**Step 4 — CRT Reconstruction:** Results are recombined using precomputed
-CRT coefficients to recover the exact integer result, then rescaled to FP64.
-
-### Hardware Path: Direct PTX `mma.sync`
-
-We bypass CUDA's FP64 FMA pipeline entirely using inline PTX assembly:
-
-```cuda
-asm volatile(
-    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-    : "=r"(d),"=r"(d),"=r"(d),"=r"(d)
-    : "r"(a),"r"(a),"r"(a),"r"(a),
-      "r"(b),"r"(b),
-      "r"(c),"r"(c),"r"(c),"r"(c)
-);
+A_int8[p] = round(slice * scale) mod prime[p]
 ```
 
-This routes computation through INT8 Tensor Cores, converting an FP64
-throughput problem into an INT8 throughput problem.
+**INT8 GEMM** via PTX `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`.
 
-### Memory Pipeline: `cp.async` Double Buffering
+**CRT reconstruction** with precomputed coefficients, then rescale by the
+slice inverse (`2^{-34}`, `2^{-51}`, `2^{-68}`).
 
-To hide L2/DRAM latency, we use asynchronous prefetch with double buffering:
+Four slice products: hi×hi, hi×lo, lo×hi, lo×lo.
 
-```cuda
-// Async prefetch next tile while computing on current tile
-cp.async.cg.shared.global [smem_ptr], [gmem_ptr], 16;
-cp.async.commit_group;
-// ... MMA compute on current buffer ...
-cp.async.wait_group 1;   // wait for next tile, not current
-__syncthreads();
-```
+### Memory pipeline
 
-Combined with `ldmatrix.sync` for shared memory → register tile loading,
-this pipeline achieves the **90.14% L2 hit rate** observed in profiling.
-
+`cp.async` double buffering + `ldmatrix` into the MMA fragments. Layout is
+128×32 (A) / 64×32 (B) tiles so the INT8 residual stores coalesce.
 
 ---
 
 ## Quick Start
 
-### Python API (NumPy Integration)
+**Use Phase 22.** That is the INT8 CRT path we actually want. Do not start
+from `Phase24ExtremeMix` — it turns on a naive residual FP64 GEMM, is slower
+than native `cublasDgemm`, and is not the number in the table above.
+
+`OzakiConfig.mode` already defaults to `Phase22`, with `enable_fp64` and
+`enable_residual` off. Still set them explicitly so a copy-paste cannot
+silently fall back to Phase 24.
+
+### C++
+
+```cpp
+#include "AdaptiveOzaki.h"
+
+ozaki::OzakiConfig config;
+config.mode = ozaki::ExecutionMode::Phase22;
+config.enable_fp64 = false;
+config.enable_residual = false;
+
+ozaki::AdaptiveOzakiEngine engine(config);
+engine.execute(d_A, d_B, d_C, m, n, k);  // row-major C = A * B
+```
+
+Do not do this:
+
+```cpp
+config.mode = ozaki::ExecutionMode::Phase24ExtremeMix;  // slow residual path
+```
+
+`examples/demo_main.cpp` is the Phase 22 entry point: it builds the engine as
+above and compares native DGEMM / cuBLAS Ozaki emu / Phase 22.
+
+### Python
 
 ```python
 import numpy as np
 import adaptive_gemm_py
 
 n = 1024
-A = np.random.rand(n, n)   # float64 by default
+A = np.random.rand(n, n)
 B = np.random.rand(n, n)
 
-engine = adaptive_gemm_py.AdaptiveGEMM()
+engine = adaptive_gemm_py.AdaptiveGEMM(mode="phase22")  # default; say it anyway
 C = engine.gemm(A, B)
 
-# Validate accuracy
-C_ref = A @ B
-print(f"Max Error: {np.max(np.abs(C - C_ref)):.2e}")
-# Expected: < 2e-09
+print(f"Max Error: {np.max(np.abs(C - A @ B)):.2e}")
+# around 1e-9, not 1e-15
 ```
 
-### Build from Source
+### Build the demo
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 
-# Run demo
 ./build/Release/adaptive_gemm_demo
-
-# Run tests
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+Windows:
+
+```bash
+nvcc --std=c++17 -O3 -arch=sm_89 -I include examples/demo_main.cpp src/AdaptiveOzaki.cu -o adaptive_gemm_demo.exe -lcublas -lcudart
+./adaptive_gemm_demo.exe
+```
+
 **Requirements:**
-- CUDA 12.x
-- GPU with SM 8.9 (Ada, recommended) or SM 8.0+ (Ampere)
+- CUDA 13.x for the cuBLAS emu comparison (`COMPUTE_64F_EMULATED_FIXEDPOINT`)
+- GPU with SM 8.9 (Ada). Ampere SM 8.0 may build, not the card we measured.
 - CMake 3.18+
 - C++17 compiler
 
 ---
 
-## Use Cases
+## Limitations
 
-- **Scientific Computing:** PDE solvers, Krylov methods (CG, GMRES),
-  LU/QR decomposition on consumer hardware
-- **Quantitative Finance:** Monte Carlo risk simulation, large covariance
-  matrix computation
-- **ML Research:** FP64-precision matrix ops without data-center GPU access
-- **Any scenario** requiring double-precision stability with only a consumer GPU
-
----
-
-## Limitations & Known Issues
-
-- Accuracy may degrade for ill-conditioned matrices with extreme dynamic range
-  (values spanning 10+ orders of magnitude)
-- `global_work_queue` persistent kernel counter is **not safe** for concurrent
-  multi-instance launch (known design issue, tracked for fix, ongoing optimization)
-- `analyzeMatrix()` adaptive pre-scan is not yet implemented (returns stub values)
-- Current tile size fixed at 128×64; non-multiples incur boundary handling overhead
+- **Loses to cuBLAS 13 Ozaki emulation** on Ada in both speed and accuracy.
+  If you only need a fast FP64 GEMM on CUDA 13, call cuBLAS.
+- Default Phase 22 is ~34-bit Ozaki, max error ~`1e-9` on `U(-1,1)` 2048³.
+- Phase 23–26 (hetero / residual / hybrid) still contain naive FP64 paths.
+  They can look “more accurate” because they recompute in FP64, and they are
+  slower than native DGEMM.
+- `analyzeMatrix()` is a stub.
+- Tile size is 128×64; other shapes pay padding.
+- `global_work_queue` in the Phase 26 persistent kernel is not safe for
+  concurrent engine instances.
 
 ---
 
@@ -233,20 +222,16 @@ ctest --test-dir build -C Release --output-on-failure
    of matrix multiplication and its applications."*
    Numerical Algorithms, 59(1):95–118, 2012.
 
-2. *"Analysis of Floating-Point Matrix Multiplication Computed via Integer
-   Arithmetic"* and related 2025 literature on INT8 matrix engine emulation
-   of high-precision arithmetic.
+2. NVIDIA cuBLAS — floating-point emulation (fixed-point / Ozaki for FP64,
+   CUDA 13). BF16x9 is FP32 emulation on Blackwell, not this GPU.
 
-3. NVIDIA PTX ISA Reference — `mma.sync` instruction documentation.
-
-4. NVIDIA Nsight Compute User Guide — Roofline analysis methodology.
+3. NVIDIA PTX ISA — `mma.sync`.
 
 ---
 
 ## License
 
-Apache License 2.0 — permits academic, personal, and commercial use.  
-See [LICENSE](LICENSE) for full terms.
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ---
 
@@ -254,76 +239,89 @@ See [LICENSE](LICENSE) for full terms.
 
 # 中文版
 
+消費級 Ada 的 native FP64 被限速。AdaptiveGEMM 把 2-slice Ozaki + 7 質數 CRT
+GEMM 丟上 INT8 Tensor Core。在 RTX 4060 Laptop 上它 **比 native `cublasDgemm`
+快**，也 **比 cuBLAS 13 的 FP64 emulation 慢、比較不准**。
+
+預設 Phase 22 不是滿 FP64。2048³、`U(-1,1)` 對 native DGEMM 的 max error 大約
+`3e-9`：比 FP32 好，不能拿去冒充 `cublasDgemm` 的 ulp。
+
 ## 為什麼要做這個
 
-RTX 4060 的 FP64 算力被人為限制，FP32 與 FP64 的比值高達 64:1，
-但同一張卡的 INT8 Tensor Core 峰值高達 242 TOPS，對科學計算幾乎完全閒置。
+Ada 消費卡沒有 FP64 Tensor Core，native DGEMM 走被限速的 CUDA Core。同一顆 SM
+上的 INT8 Tensor Core 幾乎閒置，這就是 Ozaki / CRT 的動機。
 
-AdaptiveGEMM 透過 Ozaki Scheme 將 FP64 精度需求拆解為多組 INT8 子問題，
-再用 CRT/RNS 重建，把消費級顯示卡的 Tensor Core 算力導向高精度矩陣乘法。
+CUDA 13 的 cuBLAS 已經把量產版做進去了
+（`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`）。這個 repo 是從零寫的 Ada 實作，
+方便讀 kernel、跑 NCU、寫文章，**不是比 NVIDIA 更快的函式庫**。
 
-## 效能（RTX 4060 Ada 實測）
+## 效能（RTX 4060 Laptop / CUDA 13.0 / 2048³ 實測）
 
-| 指標 | 數值 |
-|------|------|
-| Kernel 執行時間 | 4.13 ms |
-| INT8 Tensor Core 運算量 | 1,203 億次 ops |
-| 有效吞吐量 | ~67 TOPS（峰值的 28%）|
-| L2 快取命中率 | 90.14% |
-| 記憶體頻寬利用 | 64.26 GB/s |
-| 實際 Occupancy | 32.63% |
+| 實作 | 時間 | 等效 GFLOPS | vs native | vs native FP64 max error |
+|------|------|-------------|-----------|--------------------------|
+| cuBLAS native DGEMM | 82.2 ms | 209 | 1.0× | — |
+| AdaptiveGEMM Phase 22 | 13.6 ms | 1262 | 6.0× | 3.40e-9 |
+| cuBLAS 13 Ozaki emu | 8.5 ms | 2014 | 9.6× | 2.84e-13 |
+| 舊 Phase 24 ExtremeMix | ~130 ms | ~132 | 0.6× | 3.55e-15 |
 
-## 精準度驗證
+結論：**贏 native，輸 cuBLAS emu（大約慢 1.6×，誤差差四個數量級）。**
 
-| 矩陣規模 | 平均誤差 | 最大誤差 | 誤差 > 0.1 比例 |
-|---------|---------|---------|---------------|
-| 1024 × 1024 | < 2.50e-10 | < 2.00e-09 | **0%** |
-| 2048 × 2048 | 4.958e-10 | 3.110e-09 | **0%** |
-| 4096 × 4096 | 7.006e-10 | 4.575e-09 | **0%** |
+舊 README 寫 Phase 24 ~128 ms、error `3.55e-15`、等於 lossless FP64，那是錯的。
+`3.55e-15` 來自 residual 路徑又用 naive FP64 GEMM 重算一遍 `C`，所以準、但比
+native 還慢。Demo 預設已改 Phase 22。
 
-> 即使在 K=4096 的極大深度累加中，最大誤差仍穩定在 O(10⁻⁹)。
-> 從 N=1024 到 N=4096，矩陣規模增大 16 倍，但誤差僅增長約 2.3 倍，
-> 證實 7-Prime CRT 架構的數值穩定性。
+中文版以前寫的「kernel 4.13 ms / 67 TOPS」是單顆 CRT kernel 的量測，不是
+end-to-end GEMM，不能當標題數字。
 
-## 技術架構
+## 精準度
 
-### Ozaki 演算法 + CRT/RNS 重建
-- FP64 矩陣分割為高低兩部分（`fp64_hi()` 位元級切割）
-- 各部分映射至 7 個質數 `{127, 113, 109, 107, 103, 101, 97}` 的 INT8 殘差
-- 透過 CRT 係數重建精確整數結果，再縮放回 FP64
+Phase 22 是 17-bit high + 17-bit low（大約 34 mantissa bits）加上 7 個質數。
+所以誤差會停在 `1e-9` 附近，不是 `1e-15`。
 
-### 硬體路徑：PTX `mma.sync`
-直接用 inline PTX `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`
-驅動 INT8 Tensor Core，繞過 FP64 FMA pipeline。
+| 規模 | max abs error vs native FP64 |
+|------|------------------------------|
+| 512² | 1.5e-9 |
+| 2048³ Phase 22 | 3.40e-9 |
+| 2048³ cuBLAS emu | 2.84e-13 |
 
-### 記憶體管線：`cp.async` 雙緩衝
-`cp.async.cg.shared.global` + `ldmatrix.sync` 非同步預取，
-達到 **90.14% L2 命中率**。
+`O(10^-9)` **不是** lossless double。要更接近 FP64 需要加 slice，CRT pass 會變多。
 
+## 怎麼用
 
-## 已知瓶頸（Profiler 量測）
+**走 Phase 22，不要走 Phase 24。** Phase 22 才是 INT8 CRT 快路徑。
+`Phase24ExtremeMix` 會再跑 naive residual FP64 GEMM，比 native `cublasDgemm`
+還慢，不要當啟動範例。
 
-| 瓶頸 | 預計加速空間 | 原因 |
-|------|------------|------|
-| Global memory uncoalesced | +39.49% | INT8 殘差的跨步記憶體存取 |
-| Register spill | +51.01% | 每 thread 128 個 register 導致 local memory spill |
-| Occupancy 受限 | +47.34% | Register 壓力將理論 occupancy 上限壓至 33.33% |
+`OzakiConfig` 預設已經是 Phase 22，且 `enable_fp64` / `enable_residual` 為
+false。複製貼上時仍建議寫死，避免哪天又被改回 Phase 24。
 
-## 快速上手
+### C++
+
+```cpp
+#include "AdaptiveOzaki.h"
+
+ozaki::OzakiConfig config;
+config.mode = ozaki::ExecutionMode::Phase22;
+config.enable_fp64 = false;
+config.enable_residual = false;
+
+ozaki::AdaptiveOzakiEngine engine(config);
+engine.execute(d_A, d_B, d_C, m, n, k);
+```
+
+入口是 `examples/demo_main.cpp`，不是舊的 Phase 24 demo。
+
+### Python
 
 ```python
 import numpy as np
 import adaptive_gemm_py
 
-A = np.random.rand(1024, 1024)
-B = np.random.rand(1024, 1024)
-
-engine = adaptive_gemm_py.AdaptiveGEMM()
+engine = adaptive_gemm_py.AdaptiveGEMM(mode="phase22")
 C = engine.gemm(A, B)
-
-print(f"最大誤差: {np.max(np.abs(C - A @ B)):.2e}")
-# 預期: < 2e-09
 ```
+
+### 編譯 demo
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -331,6 +329,19 @@ cmake --build build --config Release -j$(nproc)
 ./build/Release/adaptive_gemm_demo
 ```
 
+Windows：
+
+```bash
+nvcc --std=c++17 -O3 -arch=sm_89 -I include examples/demo_main.cpp src/AdaptiveOzaki.cu -o adaptive_gemm_demo.exe -lcublas -lcudart
+./adaptive_gemm_demo.exe
+```
+
+## 限制
+
+- Ada 上速度跟精度都輸給 cuBLAS 13 Ozaki emu。只想要快的 FP64 GEMM，直接呼叫 cuBLAS。
+- Phase 23–26 還留著 naive FP64 / residual 路徑，看起來更準是因為重算，整體會比 native 慢。
+- `analyzeMatrix()` 仍是 stub。
+
 ## 授權
 
-[Apache License 2.0](LICENSE)｜允許學術、個人與商業用途。
+[Apache License 2.0](LICENSE)

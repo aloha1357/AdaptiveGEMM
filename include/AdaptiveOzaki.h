@@ -25,10 +25,10 @@ struct OzakiConfig {
     double target_epsilon = 1e-10;
     size_t vram_limit_mb = 6144;
     ExecutionMode mode = ExecutionMode::Phase22;
-    bool enable_fp64 = true;
+    bool enable_fp64 = false;
     bool enable_fp32 = false; // New for Phase 24
     bool enable_fp16 = false; // New for Phase 24
-    bool enable_residual = true;
+    bool enable_residual = false;
     bool enable_partial_residual = false;
     bool enable_kernel_fp64 = false;
     int split_fp64_bits = 8;
@@ -80,6 +80,9 @@ private:
     // Low-precision buffers for cross-terms
     float *dA_hi_f32 = nullptr, *dA_low_f32 = nullptr;
     float *dB_hi_f32 = nullptr, *dB_low_f32 = nullptr;
+    double *dA_hi = nullptr, *dA_low = nullptr;
+    double *dB_hi = nullptr, *dB_low = nullptr;
+    int ws_m_ = 0, ws_n_ = 0, ws_k_ = 0;
     
     bool workspace_allocated_ = false;
 };
