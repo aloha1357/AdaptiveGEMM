@@ -151,6 +151,23 @@ int main() {
               << max_error(h_C_reference, h_C_result) << "\n";
     std::cout << "Phase22 vs cuBLAS emu:   " << (emu_ms / adaptive_ms) << "x ( >1 means Phase22 faster )\n";
 
+    std::cout << "\ncuBLAS emu fixed mantissa (Phase 22 is ~34-bit Ozaki):\n";
+    CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(
+        handle_emu, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
+    std::vector<double> h_bits(element_count);
+    const int bit_counts[] = {16, 24, 34, 53};
+    for (int bits : bit_counts) {
+        CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(handle_emu, bits));
+        const double ms = time_ms(
+            runs, [&]() { cublas_rowmajor_ab(handle_emu, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT); });
+        CHECK_CUDA(cudaMemcpy(h_bits.data(), d_C, element_count * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        const int slices = (bits + 1 + 7) / 8;
+        std::cout << "  mantissa " << bits << "  (~" << slices << " slices, " << (slices * slices)
+                  << " GEMMs): " << ms << " ms  err " << max_error(h_C_reference, h_bits)
+                  << "  vs Phase22 " << (adaptive_ms / ms) << "x ( >1 means emu faster )\n";
+    }
+
     double cpu = 0.0;
     for (int kk = 0; kk < n; ++kk) cpu += h_A[0 * n + kk] * h_B[kk * n + 0];
     std::cout << "C[0,0] adaptive=" << h_C_result[0] << "  cpu=" << cpu

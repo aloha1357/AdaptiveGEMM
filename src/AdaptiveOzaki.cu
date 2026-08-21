@@ -797,18 +797,16 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
         int32_t cf[2][4][4];
         for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int r = 0; r < 4; r++) cf[i][j][r] = 0;
 
-        // Load sa: 128 rows x 32 cols. 256 threads * 16 bytes = 4096 bytes. (128*32 = 4096).
         int m_idx = tid / 2, k_idx = (tid % 2) * 16;
         const int8_t* ptr_A8 = &A8[p * padded_mk + get_A8_offset(rb + m_idx, k_idx, m, k)];
-        int sa_k0 = swizzle_k16(m_idx, k_idx);
-        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][sa_k0], ptr_A8); else *(int4*)&sa[0][m_idx][sa_k0] = make_int4(0, 0, 0, 0);
+        int sa_k = swizzle_k16(m_idx, k_idx);
+        if (rb + m_idx < m && k_idx < k) cp_async_16(&sa[0][m_idx][sa_k], ptr_A8); else *(int4*)&sa[0][m_idx][sa_k] = make_int4(0, 0, 0, 0);
 
-        // Load sb: 64 rows x 32 cols. 128 loads of 16 bytes.
         int n_idx = tid / 2, kb_idx = (tid % 2) * 16;
         const int8_t* ptr_B8 = &B8[p * padded_kn + get_B8_offset(cb + n_idx, kb_idx, n, k)];
-        int sb_k0 = swizzle_k16(n_idx, kb_idx);
+        int sb_k = swizzle_k16(n_idx, kb_idx);
         if (tid < 128) {
-            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][sb_k0], ptr_B8); else *(int4*)&sb[0][n_idx][sb_k0] = make_int4(0, 0, 0, 0);
+            if (cb + n_idx < n && kb_idx < k) cp_async_16(&sb[0][n_idx][sb_k], ptr_B8); else *(int4*)&sb[0][n_idx][sb_k] = make_int4(0, 0, 0, 0);
         }
         cp_async_commit();
 
@@ -817,8 +815,6 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
             ptr_B8 += 2048;
             int cbuf = (ck / 32) % 2, fbuf = 1 - cbuf;
             if (ck + 32 < k) {
-                int sa_k = swizzle_k16(m_idx, k_idx);
-                int sb_k = swizzle_k16(n_idx, kb_idx);
                 if (rb + m_idx < m && ck + 32 + k_idx < k) cp_async_16(&sa[fbuf][m_idx][sa_k], ptr_A8); else *(int4*)&sa[fbuf][m_idx][sa_k] = make_int4(0, 0, 0, 0);
                 if (tid < 128) {
                     if (cb + n_idx < n && ck + 32 + kb_idx < k) cp_async_16(&sb[fbuf][n_idx][sb_k], ptr_B8); else *(int4*)&sb[fbuf][n_idx][sb_k] = make_int4(0, 0, 0, 0);
@@ -855,7 +851,7 @@ __device__ __forceinline__ void crt_pass_kernel_body(const int8_t* __restrict__ 
                     }
                 }
             }
-            __syncthreads(); // Ensure all warps finished consuming current tile before loading next one
+            __syncthreads();
         }
         __syncthreads();
         uint64_t cp = d_coeffs_flat[off + p];

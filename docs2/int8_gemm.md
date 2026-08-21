@@ -22,8 +22,9 @@ Day 8～10 就寫這件事。一天只改一層，先對答案再談快。
 | | 時間 | 等效 GFLOPS | vs native | max error vs native |
 |---|---:|---:|---:|---|
 | cuBLAS native DGEMM | 82.2 ms | 209 | 1.0× | — |
-| AdaptiveGEMM Phase 22 | 13.6 ms | 1262 | 6.0× | 3.40e-9 |
-| cuBLAS 13 Ozaki emu | 8.5 ms | 2014 | 9.6× | 2.84e-13 |
+| AdaptiveGEMM Phase 22（XOR 後） | 10.3–11.2 ms | ~1540–1660 | ~7.5× | 3.40e-9 |
+| cuBLAS 13 Ozaki emu（dynamic） | 8.5–8.8 ms | ~1940–2010 | ~9.5× | 2.84e-13 |
+| cuBLAS emu **34-bit fixed** | **3.97 ms** | ~4330 | ~21× | **7.62e-10** |
 
 1-pass（只做 hi×hi）大約 4.4 ms，誤差已經接近完整 4-pass 的 `1e-9`。
 4-pass 13.6 ms ≈ pack ~1.4 ms + 4 × ~3.1 ms CRT。
@@ -57,7 +58,7 @@ Day 8～10 就寫這件事。一天只改一層，先對答案再談快。
 所以：kernel 做好，34-bit（~1e-9）有機會靠近 emu。  
 要同時準到 1e-13，在這張 4060 上不當成目標。
 
-公平賽之後要補：把 cuBLAS `MaxMantissaBitCount` 鎖在 16 / 24 / 34 / 53，跟 Phase 22 畫在同一張時間–誤差圖上。現在拿 3e-9 去比人家的 3e-13，沒意義。
+公平賽已跑：見下方「fixed mantissa」表。34-bit 對 34-bit，cuBLAS 仍快約 2.8×。
 
 ---
 
@@ -151,7 +152,26 @@ CRT 4 pass ≈ 2.35 ms/pass（原本 ~3.1 ms）。Wall time 13.6 → 10.9 ms（�
 
 CRT 9.38 → 8.86 ms。Wall 10.94 → 10.33 ms（再 6%）。對 emu 0.78× → 0.82×。
 
-Bank conflict 沒有一次打掉。下一步：下一個質數的 k=0 提前 prefetch，或公平賽 mantissa bits。
+Bank conflict 沒有一次打掉。
+
+### 2026-08-21 prefetch next prime：撤回
+
+最後一個 K tile 預取下一個質數的 k=0。答案仍對，CRT 8.86 → 10.36 ms，wall 10.3 → 11.8 ms。質數之間 CRT 跟 load 重疊蓋不過額外的指標／分支。已 revert。
+
+### 2026-08-21 公平賽：cuBLAS fixed mantissa
+
+`CUDA_EMULATION_MANTISSA_CONTROL_FIXED` + `MaxMantissaBitCount`。slice ≈ `ceil((bits+1)/8)`。
+
+| mantissa | 估 slice / GEMM 次數 | ms | max err vs native | vs Phase 22 |
+|---|---:|---:|---:|---|
+| 16 | 3 / 9 | 2.24 | 4.26e-5 | emu 快 5.0× |
+| 24 | 4 / 16 | 2.99 | 1.74e-7 | emu 快 3.7× |
+| **34** | **5 / 25** | **3.97** | **7.62e-10** | **emu 快 2.8×** |
+| 53 | 7 / 49 | 6.63 | 2.84e-13 | emu 快 1.7× |
+| dynamic（預設） | ADP | 8.85 | 2.84e-13 | emu 快 1.3× |
+
+對等 34-bit：cuBLAS **3.97 ms / 7.6e-10**，我們 **11.2 ms / 3.4e-9**。  
+不是「差一點」，是同一精度預算下大約 **2.8×**。下一步若還要追，該評估 8-bit Scheme I（換架構），不是再微調這顆 CRT-in-MMA kernel。
 
 ---
 
