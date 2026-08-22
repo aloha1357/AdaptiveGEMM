@@ -1,24 +1,11 @@
 #include "AdaptiveOzaki.h"
+#include "mma_sm89.cuh"
 #include <iostream>
 #include <cmath>
 #include <mma.h>
 #include <cuda_fp16.h>
 
 using namespace nvcuda;
-
-__device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* global_ptr) {
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(smem_addr), "l"(global_ptr));
-}
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-__device__ __forceinline__ void cp_async_wait_0() {
-    asm volatile("cp.async.wait_group 0;\n" ::);
-}
-__device__ __forceinline__ void cp_async_wait_1() {
-    asm volatile("cp.async.wait_group 1;\n" ::);
-}
 
 __device__ __forceinline__ double pow2_int(int exp) {
     return ldexp(1.0, exp);
@@ -52,18 +39,6 @@ __device__ __forceinline__ double fp64_hi(double v, int split_bits) {
     double scaled = v * scale;
     double high_scaled = static_cast<double>(__double2ll_rn(scaled));      
     return high_scaled / scale;
-}
-
-__device__ __forceinline__ void mma_m16n8k32_s8(
-    int32_t* d, const uint32_t* a, const uint32_t* b, const int32_t* c) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]),
-          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3])
-    );
 }
 
 namespace ozaki {

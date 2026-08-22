@@ -37,27 +37,39 @@ else()
     set(NVCC_EXTRA_FLAGS "-Xcompiler=-fPIC")
 endif()
 
-add_custom_command(
-    OUTPUT "${ADAPTIVEGEMM_OBJ}"
-    COMMAND ${NVCC_EXECUTABLE}
-        --std=c++17
-        -arch=sm_89
-        ${NVCC_EXTRA_FLAGS}
-        -I
-        ${ADAPTIVEGEMM_ROOT}/include
-        -I
-        ${CUDA_INCLUDE_DIR}
-        -c
-        ${ADAPTIVEGEMM_CU}
-        -o
-        ${ADAPTIVEGEMM_OBJ}
-    DEPENDS "${ADAPTIVEGEMM_CU}"
-    COMMENT "Compiling AdaptiveOzaki.cu with nvcc"
-    VERBATIM
-)
+function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
+    add_custom_command(
+        OUTPUT "${OBJ_FILE}"
+        COMMAND ${NVCC_EXECUTABLE}
+            --std=c++17
+            -O3
+            -arch=sm_89
+            ${NVCC_EXTRA_FLAGS}
+            -I
+            ${ADAPTIVEGEMM_ROOT}/include
+            -I
+            ${CUDA_INCLUDE_DIR}
+            -c
+            ${CU_FILE}
+            -o
+            ${OBJ_FILE}
+        DEPENDS "${CU_FILE}"
+        COMMENT "Compiling ${CU_FILE} with nvcc"
+        VERBATIM
+    )
+endfunction()
+
+set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
+adaptive_nvcc_cu_obj("${ADAPTIVEGEMM_CU}" "${ADAPTIVEGEMM_OBJ}")
+
+set(INT8GEMM_CU "${ADAPTIVEGEMM_ROOT}/src/int8_gemm.cu")
+set(INT8GEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.cu.obj")
+adaptive_nvcc_cu_obj("${INT8GEMM_CU}" "${INT8GEMM_OBJ}")
 
 add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
+    "${INT8GEMM_OBJ}"
+    "${ADAPTIVEGEMM_ROOT}/src/bench_int8.cpp"
 )
 
 set_target_properties(adaptive_gemm PROPERTIES
@@ -125,6 +137,19 @@ target_link_libraries(adaptive_gemm_precision_test
 )
 
 add_test(NAME precision COMMAND adaptive_gemm_precision_test)
+
+add_executable(adaptive_gemm_int8_test
+    tests/int8_gemm_test.cpp
+)
+
+target_link_libraries(adaptive_gemm_int8_test
+    PRIVATE
+        adaptive_gemm
+        CUDA::cublas
+        CUDA::cudart
+)
+
+add_test(NAME int8_gemm COMMAND adaptive_gemm_int8_test)
 
 # Add pytest for the Python binding
 add_test(NAME pytest_binding

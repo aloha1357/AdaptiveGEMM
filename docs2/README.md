@@ -9,7 +9,10 @@
 
 | 檔 | 內容 |
 |---|---|
+| [SPEC_int8_peak.md](SPEC_int8_peak.md) | **怎麼吃到 ~80% INT8 峰值**：Scheme I、三階段閘、PR 切法 |
 | [int8_gemm.md](int8_gemm.md) | 目標、帳、三天怎麼切、kernel 要改什麼、每次重測的數字 |
+| [io_vs_cublas.md](io_vs_cublas.md) | 為什麼 34-bit 還輸 cuBLAS 2.8×（HBM / Scheme I vs CRT） |
+| [HANDOVER.md](HANDOVER.md) | 交接 |
 
 舊報告還在：
 

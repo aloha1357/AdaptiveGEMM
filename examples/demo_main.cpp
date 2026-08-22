@@ -1,4 +1,5 @@
 #include "AdaptiveOzaki.h"
+#include "int8_gemm.h"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -69,6 +70,18 @@ int main() {
 
     cudaDeviceProp prop{};
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    int clock_khz = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
+    std::cout << "GPU: " << prop.name << "\n";
+    std::cout << "  SM: " << prop.major << "." << prop.minor
+              << ", SMs: " << prop.multiProcessorCount << "\n";
+    std::cout << "  clockRate: " << clock_khz / 1000 << " MHz\n";
+    std::cout << "  memoryBusWidth: " << prop.memoryBusWidth << " bit\n";
+    std::cout << "  sharedMemPerMultiprocessor: "
+              << prop.sharedMemPerMultiprocessor / 1024 << " KB\n";
+    std::cout << "  L2: " << prop.l2CacheSize / (1024 * 1024) << " MB\n";
+    std::cout << "  totalGlobalMem: " << prop.totalGlobalMem / (1024 * 1024) << " MB\n";
+    std::cout << "\n";
 
     std::vector<double> h_A(element_count);
     std::vector<double> h_B(element_count);
@@ -192,6 +205,17 @@ int main() {
     int wr = (int)(worst / n), wc = (int)(worst % n);
     std::cout << "worst err " << worst_err << " at (" << wr << "," << wc
               << ") adaptive=" << h_C_result[worst] << " cublas=" << h_C_reference[worst] << '\n';
+
+    {
+        constexpr int n8 = 2048;
+        std::cout << "\n[INT8 GEMM] benchmarking " << n8 << "^3 vs cublasGemmEx INT8...\n";
+        Int8GemmBench b = bench_int8_gemm_vs_cublas(n8, n8, n8);
+        std::cout << "[INT8 GEMM] our kernel:    " << b.our_ms << " ms  " << b.our_tops << " TOPS\n";
+        std::cout << "[INT8 GEMM] cuBLAS INT8:   " << b.cublas_ms << " ms  " << b.cublas_tops
+                  << " TOPS\n";
+        std::cout << "[INT8 GEMM] vs 121 TOPS:   " << b.peak_frac * 100.0 << "%\n";
+        std::cout << "[INT8 GEMM] vs cuBLAS INT8:" << b.vs_cublas * 100.0 << "%\n";
+    }
 
     CHECK_CUBLAS(cublasDestroy(handle_native));
     CHECK_CUBLAS(cublasDestroy(handle_emu));

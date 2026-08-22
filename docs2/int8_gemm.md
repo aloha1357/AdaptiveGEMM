@@ -180,3 +180,46 @@ Bank conflict 沒有一次打掉。
 - 誤差不能壞：2048 max error 仍在 `1e-8` 以內，理想維持 `~3e-9`。
 - Phase 22 wall time 往 10 ms 靠近。到 8.5 ms 才是「跟預設 emu 同一量級」，那是 Day 10 的天花板，不是今天。
 - Demo 預設維持 Phase 22。README 的啟動方式不准寫回 Phase 24。
+
+---
+
+## PR1：孤立 s8×s8→s32 GEMM（Stage A，正確性第一）
+
+**新增**：`include/mma_sm89.cuh`、`include/int8_gemm.h`、`src/int8_gemm.cu`  
+**測試**：`tests/int8_gemm_test.cpp` → `adaptive_gemm_int8_test`  
+**Demo 新增**：`[INT8 GEMM]` 列、GPU 屬性（clockRate / memoryBusWidth / sharedMemPerMultiprocessor）
+
+### Kernel 規格（`<128,128,64,3>`）
+
+| 項目 | 值 |
+|------|---|
+| CTA tile | BM=128, BN=128, BK=64 |
+| Stages | 3（3-stage cp.async pipeline） |
+| Threads | 256（8 warps） |
+| Warp map | wm=wid/2, wn=wid%2; warp tile 32×64 |
+| smem A | `[3][128][128]` = 48 KB（stride 128 for XOR） |
+| smem B | `[3][64][128]` = 24 KB |
+| smem total | **72 KB** / 101376 B 上限 → 1 CTA/SM |
+| XOR swizzle | `col_b ^ ((row & 7) << 4)`；A `col_b∈[0,64)`，B `col_b∈[0,128)` |
+| ldmatrix A | `m8n8.x4`（無 .trans） |
+| ldmatrix B | `m8n8.x2.trans` |
+| RF frag | `a_frag[2][2][4]`、`b_frag[2][8][2]`（雙緩衝） |
+| Inner loop | 2×8 = 16 mma.m16n8k32 per k1 step |
+| 對齊契約 | `m%128==0, n%128==0, k%64==0`；否則 `cudaErrorInvalidValue` |
+
+### TOPS vs cuBLAS INT8（2048³，RTX 4060 Laptop）
+
+> **注意**：以下數字在 PR1 合入後首次執行 `adaptive_gemm_demo` 填入。
+
+| Kernel | ms | TOPS | vs 121 TOPS | vs cuBLAS INT8 |
+|--------|---:|-----:|------------:|---------------:|
+| **int8_gemm_s8s8s32 `<128,128,64,3>`** | 2.31795 | 7.41 | 6.12% | 28.29% |
+| `cublasGemmEx(CUDA_R_8I, COMPUTE_32I)` | 0.65580 | 26.19 | 21.65% | 100.00% |
+
+- Gate A1：≥70% × 121 TOPS（≥85 TOPS）或 ≥90% × 實測 cuBLAS INT8 → **PR3**
+- Gate A2：≥80% × 121 TOPS（≥97 TOPS）或 ≥95% × 實測 cuBLAS INT8 → **PR3b**
+- PR1 速度可以很差；正確性（bit-exact vs cuBLAS INT8）是此 PR 的唯一 gate。
+
+### Phase 22 回歸
+
+`precision_test` n=512 仍綠（tolerance 1e-8）；Phase 22 不受 PR1 影響。
