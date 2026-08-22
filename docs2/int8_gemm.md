@@ -198,23 +198,23 @@ Bank conflict 沒有一次打掉。
 | Threads | 256（8 warps） |
 | Warp map | wm=wid/2, wn=wid%2; warp tile 32×64 |
 | smem A | `[3][128][128]` = 48 KB（stride 128 for XOR） |
-| smem B | `[3][64][128]` = 24 KB |
-| smem total | **72 KB** / 101376 B 上限 → 1 CTA/SM |
+| smem B | `[3][128][64]` = 24 KB |
+| smem total | **96 KB** / 101376 B 上限 → 1 CTA/SM (for `<128,256,64,3>`) |
 | XOR swizzle | `col_b ^ ((row & 7) << 4)`；A `col_b∈[0,64)`，B `col_b∈[0,128)` |
 | ldmatrix A | `m8n8.x4`（無 .trans） |
-| ldmatrix B | `m8n8.x2.trans` |
-| RF frag | `a_frag[2][2][4]`、`b_frag[2][8][2]`（雙緩衝） |
-| Inner loop | 2×8 = 16 mma.m16n8k32 per k1 step |
+| ldmatrix B | `m8n8.x2` |
+| RF frag | `a_frag[2][BM/64][4]`、`b_frag[2][BN/16][2]`（雙緩衝） |
+| Inner loop | BM/64 × BN/16 mma.m16n8k32 per k1 step |
 | 對齊契約 | `m%128==0, n%128==0, k%64==0`；否則 `cudaErrorInvalidValue` |
 
 ### TOPS vs cuBLAS INT8（2048³，RTX 4060 Laptop）
 
-> **注意**：以下數字在 PR1 合入後首次執行 `adaptive_gemm_demo` 填入。
+> **注意**：以下數字在 PR3 合入後首次執行 `adaptive_gemm_demo` 填入。
 
 | Kernel | ms | TOPS | vs 121 TOPS | vs cuBLAS INT8 |
 |--------|---:|-----:|------------:|---------------:|
-| **int8_gemm_s8s8s32 `<128,128,64,3>`** | 2.31795 | 7.41 | 6.12% | 28.29% |
-| `cublasGemmEx(CUDA_R_8I, COMPUTE_32I)` | 0.65580 | 26.19 | 21.65% | 100.00% |
+| **int8_gemm_s8s8s32 `<128,256,64,3>`** | 0.76339 | 22.50 | 18.59% | 90.37% |
+| `cublasGemmEx(CUDA_R_8I, COMPUTE_32I)` | 0.68994 | 24.90 | 20.57% | 100.00% |
 
 - Gate A1：≥70% × 121 TOPS（≥85 TOPS）或 ≥90% × 實測 cuBLAS INT8 → **PR3**
 - Gate A2：≥80% × 121 TOPS（≥97 TOPS）或 ≥95% × 實測 cuBLAS INT8 → **PR3b**
