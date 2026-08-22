@@ -8,11 +8,18 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
     int tid = threadIdx.x;
     int wid = tid / 32;
     int lane = tid % 32;
+    
+    // We have 8 warps (256 threads). We divide them into 4x2 grid of warps.
+    // So wm goes 0..3, wn goes 0..1.
     int wm = wid / 2;
     int wn = wid % 2;
 
     int bm_off = blockIdx.y * BM;
-    int bn_off = blockIdx.x * BN;
+    int bn_off = blockIdx.x;
+    if ((n / BN) % 8 == 0) {
+        bn_off = bn_off ^ (blockIdx.y & 7);
+    }
+    bn_off = bn_off * BN;
 
     extern __shared__ int8_t smem[];
     int8_t* sA_ptr = smem;
@@ -25,9 +32,9 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
         return col ^ (((row & 3) ^ ((row >> 4) & 3)) << 4);
     };
 
-    uint32_t a_frag[2][2][4];
-    uint32_t b_frag[2][8][2];
-    int32_t acc[2][8][4] = {};
+    uint32_t a_frag[2][BM/64][4];
+    uint32_t b_frag[2][BN/16][2];
+    int32_t acc[BM/64][BN/16][4] = {};
 
     auto load_a_smem = [&](int buf, int k_offset) {
         int8_t* sA = sA_ptr + buf * BM * 128;
@@ -62,8 +69,9 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
 
     auto load_a_frag = [&](int buf, int k_step, int fbuf) {
         int8_t* sA = sA_ptr + buf * BM * 128;
-        int ms = wm * 32;
-        for (int i = 0; i < 2; i++) {
+        int ms = wm * (BM / 4);
+        #pragma unroll
+        for (int i = 0; i < BM / 64; i++) {
             int a_row = ms + i * 16 + (lane % 16);
             int a_col = k_step + (lane / 16) * 16;
             uint32_t addr = __cvta_generic_to_shared(&sA[a_row * 128 + swizzle_A(a_row, a_col)]);
@@ -75,10 +83,11 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
 
     auto load_b_frag = [&](int buf, int k_step, int fbuf) {
         int8_t* sB = sB_ptr + buf * BN * 64;
-        int ns = wn * 64;
-        for (int j = 0; j < 8; j++) {
-            int b_row = ns + j * 8 + (lane % 8); // N!
-            int b_col = k_step + (lane / 8 % 2) * 16; // K!
+        int ns = wn * (BN / 2);
+        #pragma unroll
+        for (int j = 0; j < BN / 16; j++) {
+            int b_row = ns + j * 8 + (lane % 8);
+            int b_col = k_step + (lane / 8 % 2) * 16;
             uint32_t addr = __cvta_generic_to_shared(&sB[b_row * 64 + swizzle_B(b_row, b_col)]);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
                 : "=r"(b_frag[fbuf][j][0]), "=r"(b_frag[fbuf][j][1])
@@ -138,8 +147,10 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
             load_b_frag(next_stage, next_k1, p ^ 1);
         }
 
-        for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < 8; j++) {
+        #pragma unroll
+        for (int i = 0; i < BM / 64; i++) {
+            #pragma unroll
+            for (int j = 0; j < BN / 16; j++) {
                 mma_m16n8k32_s8(acc[i][j], a_frag[p][i], b_frag[p][j], acc[i][j]);
             }
         }
@@ -151,11 +162,14 @@ __global__ void int8_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __r
     const int r_off[2] = { lane/4, lane/4+8 };
     const int c_off = (lane%4)*2;
 
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 8; ++j) {
+    #pragma unroll
+    for (int i = 0; i < BM / 64; ++i) {
+        #pragma unroll
+        for (int j = 0; j < BN / 16; ++j) {
+            #pragma unroll
             for (int r = 0; r < 2; ++r) {
-                int gm = bm_off + wm * 32 + i*16 + r_off[r];
-                int gn = bn_off + wn * 64 + j*8  + c_off;
+                int gm = bm_off + wm * (BM / 4) + i*16 + r_off[r];
+                int gn = bn_off + wn * (BN / 2) + j*8  + c_off;
                 if (gm < m && gn < n) {
                     int2 v;
                     v.x = acc[i][j][r * 2];
@@ -182,6 +196,9 @@ cudaError_t int8_gemm_s8s8s32_launch(const int8_t* A, const int8_t* B, int32_t* 
 
 cudaError_t int8_gemm_s8s8s32(const int8_t* A, const int8_t* B, int32_t* C,
                                int m, int n, int k, cudaStream_t stream) {
+    if (n % 256 == 0) {
+        return int8_gemm_s8s8s32_launch<128, 256, 64, 3>(A, B, C, m, n, k, stream);
+    }
     return int8_gemm_s8s8s32_launch<128, 128, 64, 3>(A, B, C, m, n, k, stream);
 }
 }
