@@ -217,6 +217,21 @@ int main() {
         std::cout << "[INT8 GEMM] vs cuBLAS INT8:" << b.vs_cublas * 100.0 << "%\n";
     }
 
+    {
+        OzakiConfig cfg_scheme_i;
+        cfg_scheme_i.mode = ExecutionMode::SchemeI;
+        cfg_scheme_i.scheme_i_mantissa_bits = 34;
+        cfg_scheme_i.scheme_i_triangular = true;
+        cfg_scheme_i.scheme_i_pair_threshold = 4;
+        cfg_scheme_i.scheme_i_use_cublas_int8 = true;
+        AdaptiveOzakiEngine engine_i(cfg_scheme_i);
+        std::vector<double> h_C_scheme_i(element_count, 0.0);
+        const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
+        CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+        std::cout << "\n[SchemeI] bits=34 p=5 pairs=15 backend=cublas  total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
+        std::cout << "          (Note: B v0 uses 1760 MiB. 無 6.0 ms 閘)\n";
+    }
+
     CHECK_CUBLAS(cublasDestroy(handle_native));
     CHECK_CUBLAS(cublasDestroy(handle_emu));
     CHECK_CUDA(cudaFree(emu_ws));

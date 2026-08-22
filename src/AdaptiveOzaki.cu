@@ -1,4 +1,5 @@
 #include "AdaptiveOzaki.h"
+#include "scheme_i.h"
 #include "mma_sm89.cuh"
 #include <iostream>
 #include <cmath>
@@ -56,53 +57,124 @@ __device__ __forceinline__ void ldmatrix_x2_int8(uint32_t* d, void* smem_ptr) {
 }
 
 AdaptiveOzakiEngine::AdaptiveOzakiEngine(const OzakiConfig& config) : config_(config) {
+    cublasCreate(&cublas_handle_);
 }
 AdaptiveOzakiEngine::~AdaptiveOzakiEngine() { 
     freeWorkspace(); 
+    cublasDestroy(cublas_handle_);
 }
 
 void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     if (workspace_allocated_) freeWorkspace();
-    int nm = (m + 127) / 128, nn = (n + 127) / 128;
-    cudaMalloc(&dmA_h, nm * sizeof(uint64_t)); cudaMalloc(&dmA_l, nm * sizeof(uint64_t));
-    cudaMalloc(&dmB_h, nn * sizeof(uint64_t)); cudaMalloc(&dmB_l, nn * sizeof(uint64_t));
+    
+    if (config_.mode != ExecutionMode::SchemeI) {
+        int nm = (m + 127) / 128, nn = (n + 127) / 128;
+        cudaMalloc(&dmA_h, nm * sizeof(uint64_t)); cudaMalloc(&dmA_l, nm * sizeof(uint64_t));
+        cudaMalloc(&dmB_h, nn * sizeof(uint64_t)); cudaMalloc(&dmB_l, nn * sizeof(uint64_t));
 
-    size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
-    size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
-    cudaMalloc(&dA8_h, 7ULL * padded_mk); cudaMalloc(&dA8_l, 7ULL * padded_mk);
-    cudaMalloc(&dB8_h, 7ULL * padded_kn); cudaMalloc(&dB8_l, 7ULL * padded_kn);
+        size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
+        size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
+        cudaMalloc(&dA8_h, 7ULL * padded_mk); cudaMalloc(&dA8_l, 7ULL * padded_mk);
+        cudaMalloc(&dB8_h, 7ULL * padded_kn); cudaMalloc(&dB8_l, 7ULL * padded_kn);
 
-    // Split / residual buffers are only used by Phase 23-26 slow paths.
-    const bool need_split =
-        config_.enable_fp64 || config_.enable_residual ||
-        config_.mode == ExecutionMode::Phase26HybridOzaki;
-    if (need_split) {
-        size_t mk = (size_t)m * k;
-        size_t kn = (size_t)k * n;
-        cudaMalloc(&dA_hi_f32, mk * sizeof(float));
-        cudaMalloc(&dA_low_f32, mk * sizeof(float));
-        cudaMalloc(&dB_hi_f32, kn * sizeof(float));
-        cudaMalloc(&dB_low_f32, kn * sizeof(float));
-        cudaMalloc(&dA_hi, mk * sizeof(double));
-        cudaMalloc(&dA_low, mk * sizeof(double));
-        cudaMalloc(&dB_hi, kn * sizeof(double));
-        cudaMalloc(&dB_low, kn * sizeof(double));
-        cudaMalloc(&d_global_work_queue, sizeof(int));
+        const bool need_split =
+            config_.enable_fp64 || config_.enable_residual ||
+            config_.mode == ExecutionMode::Phase26HybridOzaki;
+        if (need_split) {
+            size_t mk = (size_t)m * k;
+            size_t kn = (size_t)k * n;
+            cudaMalloc(&dA_hi_f32, mk * sizeof(float));
+            cudaMalloc(&dA_low_f32, mk * sizeof(float));
+            cudaMalloc(&dB_hi_f32, kn * sizeof(float));
+            cudaMalloc(&dB_low_f32, kn * sizeof(float));
+            cudaMalloc(&dA_hi, mk * sizeof(double));
+            cudaMalloc(&dA_low, mk * sizeof(double));
+            cudaMalloc(&dB_hi, kn * sizeof(double));
+            cudaMalloc(&dB_low, kn * sizeof(double));
+            cudaMalloc(&d_global_work_queue, sizeof(int));
+        }
+    } else {
+        int p = (config_.scheme_i_mantissa_bits + 1 + 7) / 8;
+        size_t bytes_A = (size_t)p * m * k * sizeof(int8_t);
+        size_t bytes_B = (size_t)p * k * n * sizeof(int8_t);
+        size_t bytes_C32 = (size_t)m * n * sizeof(int32_t);
+        size_t sum_A = (size_t)p * m * sizeof(int32_t);
+        size_t sum_B = (size_t)p * n * sizeof(int32_t);
+        
+        size_t total_bytes = bytes_A + bytes_B + m * sizeof(double) + n * sizeof(double) +
+                             m * sizeof(int32_t) + n * sizeof(int32_t) + sum_A + sum_B + bytes_C32;
+        
+        if (total_bytes > config_.vram_limit_mb * 1024ULL * 1024ULL) {
+            std::cerr << "OOM: SchemeI workspace exceeds vram limit\n";
+            throw std::runtime_error("cudaErrorMemoryAllocation");
+        }
+        
+        std::cout << "[SchemeI] allocateWorkspace bytes = " << total_bytes << "\n";
+        
+        cudaMalloc(&d_A_slices, bytes_A);
+        cudaMalloc(&d_B_slices, bytes_B);
+        cudaMalloc(&d_maxA, m * sizeof(double));
+        cudaMalloc(&d_maxB, n * sizeof(double));
+        cudaMalloc(&d_eA, m * sizeof(int32_t));
+        cudaMalloc(&d_eB, n * sizeof(int32_t));
+        cudaMalloc(&d_row_sum, sum_A);
+        cudaMalloc(&d_col_sum, sum_B);
+        cudaMalloc(&d_C_i32, bytes_C32);
     }
+
     ws_m_ = m; ws_n_ = n; ws_k_ = k;
+    ws_mode_ = config_.mode;
     workspace_allocated_ = true;
 }
-
 void AdaptiveOzakiEngine::freeWorkspace() {
     if (!workspace_allocated_) return;
-    cudaFree(dmA_h); cudaFree(dmA_l); cudaFree(dmB_h); cudaFree(dmB_l);
-    cudaFree(dA8_h); cudaFree(dA8_l); cudaFree(dB8_h); cudaFree(dB8_l);
-    cudaFree(dA_hi_f32); cudaFree(dA_low_f32); cudaFree(dB_hi_f32); cudaFree(dB_low_f32);
-    cudaFree(dA_hi); cudaFree(dA_low); cudaFree(dB_hi); cudaFree(dB_low);
-    cudaFree(d_global_work_queue);
-    dA_hi = dA_low = dB_hi = dB_low = nullptr;
+    
+    cudaFree(dmA_h); dmA_h = nullptr; cudaFree(dmA_l); dmA_l = nullptr;
+    cudaFree(dmB_h); dmB_h = nullptr; cudaFree(dmB_l); dmB_l = nullptr;
+    cudaFree(dA8_h); dA8_h = nullptr; cudaFree(dA8_l); dA8_l = nullptr;
+    cudaFree(dB8_h); dB8_h = nullptr; cudaFree(dB8_l); dB8_l = nullptr;
+    
+    cudaFree(dA_hi_f32); dA_hi_f32 = nullptr; cudaFree(dA_low_f32); dA_low_f32 = nullptr;
+    cudaFree(dB_hi_f32); dB_hi_f32 = nullptr; cudaFree(dB_low_f32); dB_low_f32 = nullptr;
+    cudaFree(dA_hi); dA_hi = nullptr; cudaFree(dA_low); dA_low = nullptr;
+    cudaFree(dB_hi); dB_hi = nullptr; cudaFree(dB_low); dB_low = nullptr;
+    cudaFree(d_global_work_queue); d_global_work_queue = nullptr;
+    
+    cudaFree(d_A_slices); d_A_slices = nullptr;
+    cudaFree(d_B_slices); d_B_slices = nullptr;
+    cudaFree(d_maxA); d_maxA = nullptr;
+    cudaFree(d_maxB); d_maxB = nullptr;
+    cudaFree(d_eA); d_eA = nullptr;
+    cudaFree(d_eB); d_eB = nullptr;
+    cudaFree(d_row_sum); d_row_sum = nullptr;
+    cudaFree(d_col_sum); d_col_sum = nullptr;
+    cudaFree(d_C_i32); d_C_i32 = nullptr;
+    
     ws_m_ = ws_n_ = ws_k_ = 0;
     workspace_allocated_ = false;
+}
+
+size_t AdaptiveOzakiEngine::workspaceBytes() const {
+    if (!workspace_allocated_) return 0;
+    size_t total = 0;
+    
+    if (config_.mode == ExecutionMode::SchemeI) {
+        int p = (config_.scheme_i_mantissa_bits + 1 + 7) / 8;
+        total += (size_t)p * ws_m_ * ws_k_ * sizeof(int8_t);
+        total += (size_t)p * ws_k_ * ws_n_ * sizeof(int8_t);
+        total += (size_t)ws_m_ * ws_n_ * sizeof(int32_t);
+        total += ws_m_ * sizeof(double) + ws_n_ * sizeof(double);
+        total += ws_m_ * sizeof(int32_t) + ws_n_ * sizeof(int32_t);
+        total += (size_t)p * ws_m_ * sizeof(int32_t) + (size_t)p * ws_n_ * sizeof(int32_t);
+    } else {
+        // Phase 22, etc
+        int nm = (ws_m_ + 127) / 128, nn = (ws_n_ + 127) / 128;
+        total += (nm + nn) * 2 * sizeof(uint64_t);
+        size_t padded_mk = (size_t)((ws_m_ + 127) / 128) * ((ws_k_ + 31) / 32) * 4096;
+        size_t padded_kn = (size_t)((ws_n_ + 63) / 64) * ((ws_k_ + 31) / 32) * 2048;
+        total += 7ULL * (padded_mk + padded_kn) * 2;
+    }
+    return total;
 }
 
 PreScanStats AdaptiveOzakiEngine::analyzeMatrix(const double* d_A, const double* d_B, int m, int n, int k) { return PreScanStats{1.0, 0.0, std::min(m, std::min(n, k))}; }
@@ -1220,6 +1292,27 @@ __global__ void hybrid_ozaki_persistent_kernel(
 }
 
 void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, int m, int n, int k) {
+
+    if (config_.mode == ExecutionMode::SchemeI) {
+        if (!workspace_allocated_ || ws_mode_ != config_.mode || ws_m_ != m || ws_n_ != n || ws_k_ != k) {
+            allocateWorkspace(m, n, k);
+        }
+        
+        if (config_.scheme_i_fused) {
+            execute_scheme_i_fused(dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+                                   config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
+                                   d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum);
+        } else if (config_.scheme_i_use_cublas_int8) {
+            execute_scheme_i_v0(cublas_handle_, dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+                                config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
+                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32);
+        } else {
+            execute_scheme_i_b1(dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+                                config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
+                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum);
+        }
+        return;
+    }
 
     if (config_.mode == ExecutionMode::Phase26HybridOzaki) {
         profileHardwareRatio();

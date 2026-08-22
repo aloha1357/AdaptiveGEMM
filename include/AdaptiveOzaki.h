@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <vector>
 #include <memory>
 #include <cstdint>
@@ -18,7 +19,8 @@ enum class ExecutionMode {
     Phase23Hetero,
     Phase24ExtremeMix,
     Phase25Stacking,
-    Phase26HybridOzaki
+    Phase26HybridOzaki,
+    SchemeI
 };
 
 struct OzakiConfig {
@@ -40,6 +42,13 @@ struct OzakiConfig {
     int warp_tc = 4;
     int warp_residual = 2;
     double tile_error_guard = 1e-9;
+    
+    // Scheme I specific fields
+    int  scheme_i_mantissa_bits = 34;
+    bool scheme_i_triangular = true;
+    int  scheme_i_pair_threshold = 4;      // a+b <= 4 -> 15 pairs, 0-based
+    bool scheme_i_use_cublas_int8 = true;  // B v0; flip is PR4b
+    bool scheme_i_fused = false;           // PR6
 };
 
 class AdaptiveOzakiEngine {
@@ -52,6 +61,7 @@ public:
     // Workspace management
     void allocateWorkspace(int m, int n, int k);
     void freeWorkspace();
+    size_t workspaceBytes() const;
 
     static void bitShiftToINT8(const double* d_src, int8_t* d_dst_int8, int elem_count, int exponent_shift);
     static void computeResidualGradedRing(const double* d_A, const double* d_B, const double* d_C, double* d_R, int m, int n, int k);
@@ -82,8 +92,21 @@ private:
     float *dB_hi_f32 = nullptr, *dB_low_f32 = nullptr;
     double *dA_hi = nullptr, *dA_low = nullptr;
     double *dB_hi = nullptr, *dB_low = nullptr;
-    int ws_m_ = 0, ws_n_ = 0, ws_k_ = 0;
     
+    // Scheme I workspace
+    int8_t* d_A_slices = nullptr;
+    int8_t* d_B_slices = nullptr;
+    double* d_maxA = nullptr;
+    double* d_maxB = nullptr;
+    int32_t* d_eA = nullptr;
+    int32_t* d_eB = nullptr;
+    int32_t* d_row_sum = nullptr;
+    int32_t* d_col_sum = nullptr;
+    int32_t* d_C_i32 = nullptr;
+    
+    int ws_m_ = 0, ws_n_ = 0, ws_k_ = 0;
+    ExecutionMode ws_mode_ = ExecutionMode::Phase22;
     bool workspace_allocated_ = false;
+    cublasHandle_t cublas_handle_;
 };
 } 

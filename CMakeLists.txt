@@ -53,7 +53,7 @@ function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
             ${CU_FILE}
             -o
             ${OBJ_FILE}
-        DEPENDS "${CU_FILE}"
+        DEPENDS "${CU_FILE}" "${ADAPTIVEGEMM_ROOT}/include/AdaptiveOzaki.h" "${ADAPTIVEGEMM_ROOT}/include/scheme_i.h"
         COMMENT "Compiling ${CU_FILE} with nvcc"
         VERBATIM
     )
@@ -66,9 +66,14 @@ set(INT8GEMM_CU "${ADAPTIVEGEMM_ROOT}/src/int8_gemm.cu")
 set(INT8GEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.cu.obj")
 adaptive_nvcc_cu_obj("${INT8GEMM_CU}" "${INT8GEMM_OBJ}")
 
+set(SCHEME_I_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_i.cu")
+set(SCHEME_I_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_i.cu.obj")
+adaptive_nvcc_cu_obj("${SCHEME_I_CU}" "${SCHEME_I_OBJ}")
+
 add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
     "${INT8GEMM_OBJ}"
+    "${SCHEME_I_OBJ}"
     "${ADAPTIVEGEMM_ROOT}/src/bench_int8.cpp"
 )
 
@@ -150,6 +155,19 @@ target_link_libraries(adaptive_gemm_int8_test
 )
 
 add_test(NAME int8_gemm COMMAND adaptive_gemm_int8_test)
+
+add_executable(adaptive_gemm_scheme_i_test
+    tests/scheme_i_precision_test.cpp
+)
+
+target_link_libraries(adaptive_gemm_scheme_i_test
+    PRIVATE
+        adaptive_gemm
+        CUDA::cublas
+        CUDA::cudart
+)
+
+add_test(NAME scheme_i COMMAND adaptive_gemm_scheme_i_test)
 
 # Add pytest for the Python binding
 add_test(NAME pytest_binding

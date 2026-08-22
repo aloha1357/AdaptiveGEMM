@@ -54,6 +54,7 @@ static ExecutionMode parse_mode(const std::string& mode) {
     if (mode == "phase24" || mode == "Phase24ExtremeMix") return ExecutionMode::Phase24ExtremeMix;
     if (mode == "phase25" || mode == "Phase25Stacking") return ExecutionMode::Phase25Stacking;
     if (mode == "phase26" || mode == "Phase26HybridOzaki") return ExecutionMode::Phase26HybridOzaki;
+    if (mode == "scheme_i" || mode == "SchemeI") return ExecutionMode::SchemeI;
     throw std::runtime_error("Unknown mode '" + mode + "'. Use phase22 (default).");
 }
 

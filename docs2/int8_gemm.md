@@ -222,4 +222,25 @@ Bank conflict 沒有一次打掉。
 
 ### Phase 22 回歸
 
-`precision_test` n=512 仍綠（tolerance 1e-8）；Phase 22 不受 PR1 影響。
+`precision_test` n=512 仍綠（tolerance 1e-8）；Phase 22 不受 PR1 / PR2 影響。
+
+---
+
+## PR2：Scheme I B v0（cuBLAS INT8 + INT32 scratch）
+
+**新增**：`include/scheme_i.h`、`src/scheme_i.cu`、`tests/scheme_i_precision_test.cpp`  
+**Demo**：`[SchemeI] bits=34 p=5 pairs=15 backend=cublas`
+
+正確性閘 only，**無 6.0 ms 閘**。B v0 估 1760 MiB HBM（INT32 落地）。Default 仍 Phase 22。
+
+n=512 vs CPU gold（mantissa=34, p=5）：
+
+| 資料 | 15 pair（T=4，預設） | 25 pair（oracle） |
+|------|---------------------:|------------------:|
+| U(-1,1) | 2.07e-6 | **1.41e-9** |
+| mixed（一列 \|A\|~256） | 5.07e-4 | 2.27e-7 |
+
+- 25 pair + U(-1,1) ≤ 1e-8：編碼 / bilinear bias / cuBLAS INT8 是通的。
+- 15 pair ~2e-6 是丟 `a+b≥5` 的代價，不是 bug。T=4 是速度預設，不是 1e-8。
+- mixed 25 pair 絕對誤差未到 1e-8（2.3e-7），文件照實寫。
+- k=1 golden 走 naive INT8（cuBLAS INT8 tensor 要 k%4==0）。n=512 走 `cublasGemmEx`。

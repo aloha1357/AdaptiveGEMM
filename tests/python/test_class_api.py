@@ -8,3 +8,14 @@ def test_gemm_class_small():
     C = engine.gemm(A, B)
     expected = A.dot(B)
     assert np.allclose(C, expected)
+
+def test_gemm_modes():
+    import pytest
+    from adaptive_gemm_py import AdaptiveGEMM
+    
+    # Should not throw
+    engine = AdaptiveGEMM(mode="scheme_i")
+    
+    # Should throw
+    with pytest.raises(RuntimeError):
+        AdaptiveGEMM(mode="unknown_mode")
