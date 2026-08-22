@@ -1,3 +1,4 @@
+﻿#include "int8_gemm.h"
 #include "scheme_i.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -143,13 +144,10 @@ __global__ void naive_int8_gemm(int m, int n, int k, const int8_t* A, const int8
     }
 }
 
-void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B, double* d_C, 
-                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
-                         int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
-                         int32_t* C_i32) {
-    int p = (mantissa_bits + 1 + 7) / 8; // ceil((mantissaBitCount + 1) / 8)
-    
+void scheme_i_pack(const double* d_A, const double* d_B, double* d_C, 
+                   int m, int n, int k, int mantissa_bits, int p,
+                   int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
+                   int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {
     cudaMemsetAsync(d_C, 0, (size_t)m * n * sizeof(double), 0);
     cudaMemset(maxA, 0, m * sizeof(double));
     cudaMemset(maxB, 0, n * sizeof(double));
@@ -172,6 +170,15 @@ void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B,
     CHECK_CUDA(cudaGetLastError());
     scheme_i_write_slices_B<<<(n + threads - 1) / threads, threads>>>(d_B, eB, B_slices, col_sum, k, n, p, mantissa_bits);
     CHECK_CUDA(cudaGetLastError());
+}
+
+void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B, double* d_C, 
+                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                         int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
+                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
+                         int32_t* C_i32) {
+    int p = (mantissa_bits + 1 + 7) / 8; // ceil((mantissaBitCount + 1) / 8)
+    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
     
     int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
         int32_t alpha = 1, beta = 0;
@@ -206,7 +213,38 @@ void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B,
 void execute_scheme_i_b1(const double* d_A, const double* d_B, double* d_C, 
                          int m, int n, int k, int mantissa_bits, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {}
+                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {
+    int p = (mantissa_bits + 1 + 7) / 8;
+    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
+    
+    int32_t* C_i32 = nullptr;
+    if (k % 64 != 0) {
+        cudaMallocAsync(&C_i32, (size_t)m * n * sizeof(int32_t), 0);
+    }
+    
+    int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
+        int sh = 8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
+        if (k % 64 != 0) {
+            dim3 block(16, 16);
+            dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+            naive_int8_gemm<<<grid, block>>>(m, n, k, A_slices + (size_t)a * m * k, B_slices + (size_t)b * k * n, C_i32);
+            dim3 b2(32, 8);
+            dim3 g2((n + b2.x - 1) / b2.x, (m + b2.y - 1) / b2.y);
+            accumulate_i32_to_f64<<<g2, b2>>>(d_C, C_i32, eA, eB,
+                                           row_sum + a * m, col_sum + b * n,
+                                           a == 0 ? 0 : 128, b == 0 ? 0 : 128, m, n, k, sh);
+        } else {
+            int8_gemm_s8s8s32_f64_epilogue(
+                A_slices + (size_t)a * m * k, B_slices + (size_t)b * k * n, d_C, eA, eB,
+                row_sum + a * m, col_sum + b * n,
+                a == 0 ? 0 : 128, b == 0 ? 0 : 128, m, n, k, sh, 0);
+        }
+    });
+
+    if (C_i32) {
+        cudaFreeAsync(C_i32, 0);
+    }
+}
 
 void execute_scheme_i_fused(const double* d_A, const double* d_B, double* d_C, 
                             int m, int n, int k, int mantissa_bits, bool triangular, int T,

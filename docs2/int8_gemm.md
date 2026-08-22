@@ -244,3 +244,18 @@ n=512 vs CPU gold（mantissa=34, p=5）：
 - 15 pair ~2e-6 是丟 `a+b≥5` 的代價，不是 bug。T=4 是速度預設，不是 1e-8。
 - mixed 25 pair 絕對誤差未到 1e-8（2.3e-7），文件照實寫。
 - k=1 golden 走 naive INT8（cuBLAS INT8 tensor 要 k%4==0）。n=512 走 `cublasGemmEx`。
+
+---
+
+## PR4a: Scheme I B.1 (intree INT8 GEMM + FP64 Epilogue)
+
+**實作**: int8_gemm_s8s8s32_f64_epilogue (在 src/int8_gemm.cu) 與 execute_scheme_i_b1 (在 src/scheme_i.cu)
+**Demo**: [SchemeI] bits=34 p=5 pairs=15 backend=intree_f64_epilogue
+
+同一套 pack / pair 邏輯，把 cuBLAS 換成 in-tree 的 INT8 GEMM 核心，並在 epilogue 直接把 INT32 累加成 FP64 寫入 C，省去 1760 MiB 的 C_i32 scratch 空間。
+
+2048³ 效能數據 (RTX 4060 Laptop):
+- backend=cublas: ~19.94 ms
+- backend=intree_f64_epilogue: ~22.07 ms (估 1280 MiB；6.0 ms 是量測閘不是保證)
+
+精準度與 B v0 (cuBLAS) bit-exact (n=512, 15/25 pair 誤差皆一致)。

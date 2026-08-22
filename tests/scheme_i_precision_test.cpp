@@ -1,4 +1,4 @@
-#include "AdaptiveOzaki.h"
+﻿#include "AdaptiveOzaki.h"
 #include "scheme_i.h"
 #include <iostream>
 #include <vector>
@@ -165,42 +165,52 @@ static void test_gemm(int n, bool mixed) {
     CHECK_CUDA(cudaMalloc(&d_C, n * n * sizeof(double)));
     CHECK_CUDA(cudaMemcpy(d_A, h_A.data(), n * n * sizeof(double), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), n * n * sizeof(double), cudaMemcpyHostToDevice));
+
+    auto run_engine = [&](bool use_cublas, int threshold, double& max_err) {
+        OzakiConfig config;
+        config.mode = ExecutionMode::SchemeI;
+        config.scheme_i_mantissa_bits = 34;
+        config.scheme_i_triangular = (threshold == 4); // 15 pairs
+        config.scheme_i_pair_threshold = threshold;
+        config.scheme_i_use_cublas_int8 = use_cublas;
+        config.scheme_i_fused = false;
+        AdaptiveOzakiEngine engine(config);
+        
+        engine.execute(d_A, d_B, d_C, n, n, n);
+        CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, n * n * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        max_err = 0;
+        for (int i = 0; i < n * n; ++i) max_err = std::max(max_err, std::abs(h_C[i] - h_C_ref[i]));
+    };
     
-    OzakiConfig config;
-    config.mode = ExecutionMode::SchemeI;
-    config.scheme_i_mantissa_bits = 34;
-    config.scheme_i_triangular = true;
-    config.scheme_i_pair_threshold = 4; // 15 pairs
-    config.scheme_i_use_cublas_int8 = true;
-    AdaptiveOzakiEngine engine(config);
+    double err_15_v0 = 0, err_25_v0 = 0;
+    double err_15_b1 = 0, err_25_b1 = 0;
     
-    engine.execute(d_A, d_B, d_C, n, n, n);
-    CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, n * n * sizeof(double), cudaMemcpyDeviceToHost));
+    run_engine(true, 4, err_15_v0);
+    run_engine(true, 5, err_25_v0);
     
-    double max_err_15 = 0;
-    for (int i = 0; i < n * n; ++i) max_err_15 = std::max(max_err_15, std::abs(h_C[i] - h_C_ref[i]));
+    run_engine(false, 4, err_15_b1);
+    run_engine(false, 5, err_25_b1);
     
-    config.scheme_i_triangular = false; // 25 pairs
-    AdaptiveOzakiEngine engine25(config);
-    engine25.execute(d_A, d_B, d_C, n, n, n);
-    CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, n * n * sizeof(double), cudaMemcpyDeviceToHost));
+    std::cout << "v0: 15 pairs err=" << err_15_v0 << "  25 pairs err=" << err_25_v0 << "\n";
+    std::cout << "b1: 15 pairs err=" << err_15_b1 << "  25 pairs err=" << err_25_b1 << "\n";
     
-    double max_err_25 = 0;
-    for (int i = 0; i < n * n; ++i) max_err_25 = std::max(max_err_25, std::abs(h_C[i] - h_C_ref[i]));
-    
-    std::cout << "15 pairs err=" << max_err_15 << "  25 pairs err=" << max_err_25 << "\n";
-    
-    if (!mixed) {
-        if (max_err_25 > 1e-8) { std::cerr << "err_25 > 1e-8\n"; std::exit(1); }
-        if (max_err_15 >= 1e-4 || max_err_15 <= max_err_25) { 
-            std::cerr << "err_15 sanity check failed (expected err_25 < err_15 < 1e-4)\n"; 
-            std::exit(1); 
+    auto check_errs = [&](double max_err_15, double max_err_25, const char* name) {
+        if (!mixed) {
+            if (max_err_25 > 1e-8) { std::cerr << name << " err_25 > 1e-8\n"; std::exit(1); }
+            if (max_err_15 >= 1e-4 || max_err_15 <= max_err_25) { 
+                std::cerr << name << " err_15 sanity check failed (expected err_25 < err_15 < 1e-4)\n"; 
+                std::exit(1); 
+            }
+        } else {
+            if (max_err_25 > 1e-8) {
+                std::cout << "WARN " << name << " mixed 25-pair abs err=" << max_err_25 << " (SPEC 1e-8 not met; relative TBD)\n";
+            }
         }
-    } else {
-        if (max_err_25 > 1e-8) {
-            std::cout << "WARN mixed 25-pair abs err=" << max_err_25 << " (SPEC 1e-8 not met; relative TBD)\n";
-        }
-    }
+    };
+    
+    check_errs(err_15_v0, err_25_v0, "v0");
+    check_errs(err_15_b1, err_25_b1, "b1");
     
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
 }
