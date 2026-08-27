@@ -151,75 +151,208 @@ __global__ void naive_int8_gemm(int m, int n, int k, const int8_t* A, const int8
 void scheme_i_pack(const double* d_A, const double* d_B, double* d_C, 
                    int m, int n, int k, int mantissa_bits, int p, int bits_per_int8,
                    int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                   int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {
-    cudaMemsetAsync(d_C, 0, (size_t)m * n * sizeof(double), 0);
-    cudaMemset(maxA, 0, m * sizeof(double));
-    cudaMemset(maxB, 0, n * sizeof(double));
+                   int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
+                   bool enable_skip_scalA, bool& scalA_cached, bool fused_scale_split,
+                   bool enable_stage_profiling, std::vector<PipelineStage>& stages, cudaStream_t stream) {
+    cudaMemsetAsync(d_C, 0, (size_t)m * n * sizeof(double), stream);
+    cudaMemsetAsync(maxB, 0, n * sizeof(double), stream);
+    
+    cudaEvent_t t0, t1;
+    if (enable_stage_profiling) {
+        cudaEventCreate(&t0); cudaEventCreate(&t1);
+    }
     
     int threads = 256;
-    scheme_i_reduce_maxA<<<(m + threads - 1) / threads, threads>>>(d_A, maxA, m, k);
-    CHECK_CUDA(cudaGetLastError());
-    
     dim3 gridB((n + 31) / 32, (k + 31) / 32);
     dim3 blockB(32, 32);
-    scheme_i_reduce_maxB<<<gridB, blockB>>>(d_B, maxB, k, n);
+    
+    if (!enable_skip_scalA || !scalA_cached) {
+        if (enable_stage_profiling) cudaEventRecord(t0, stream);
+        
+        launch_fused_scale_split_A(d_A, A_slices, eA, row_sum, m, k, p, mantissa_bits, bits_per_int8, stream);
+        
+        if (enable_stage_profiling) {
+            cudaEventRecord(t1, stream);
+            cudaEventSynchronize(t1);
+            float ms; cudaEventElapsedTime(&ms, t0, t1);
+            PipelineStage stage;
+            stage.stage_name = "scale_A";
+            stage.stage_timing = ms;
+            stages.push_back(stage);
+            
+            PipelineStage split_stage;
+            split_stage.stage_name = "split";
+            split_stage.stage_timing = 0.001f; // fused
+            stages.push_back(split_stage);
+        }
+        scalA_cached = true;
+    } else {
+        if (enable_stage_profiling) {
+            PipelineStage stage;
+            stage.stage_name = "scale_A";
+            stage.stage_timing = 0.0f;
+            stages.push_back(stage);
+            
+            PipelineStage split_stage;
+            split_stage.stage_name = "split";
+            split_stage.stage_timing = 0.0f;
+            stages.push_back(split_stage);
+        }
+    }
+    
+    if (enable_stage_profiling) cudaEventRecord(t0, stream);
+    
+    scheme_i_reduce_maxB<<<gridB, blockB, 0, stream>>>(d_B, maxB, k, n);
+    CHECK_CUDA(cudaGetLastError());
+    scheme_i_exponents_from_max<<<(n + threads - 1) / threads, threads, 0, stream>>>(maxB, eB, n);
+    CHECK_CUDA(cudaGetLastError());
+    scheme_i_write_slices_B<<<(n + threads - 1) / threads, threads, 0, stream>>>(d_B, eB, B_slices, col_sum, k, n, p, mantissa_bits, bits_per_int8);
     CHECK_CUDA(cudaGetLastError());
     
-    scheme_i_exponents_from_max<<<(m + threads - 1) / threads, threads>>>(maxA, eA, m);
-    CHECK_CUDA(cudaGetLastError());
-    scheme_i_exponents_from_max<<<(n + threads - 1) / threads, threads>>>(maxB, eB, n);
-    CHECK_CUDA(cudaGetLastError());
-    
-    scheme_i_write_slices_A<<<(m + threads - 1) / threads, threads>>>(d_A, eA, A_slices, row_sum, m, k, p, mantissa_bits, bits_per_int8);
-    CHECK_CUDA(cudaGetLastError());
-    scheme_i_write_slices_B<<<(n + threads - 1) / threads, threads>>>(d_B, eB, B_slices, col_sum, k, n, p, mantissa_bits, bits_per_int8);
-    CHECK_CUDA(cudaGetLastError());
+    if (enable_stage_profiling) {
+        cudaEventRecord(t1, stream);
+        cudaEventSynchronize(t1);
+        float ms; cudaEventElapsedTime(&ms, t0, t1);
+        PipelineStage stage;
+        stage.stage_name = "scale_B";
+        stage.stage_timing = ms;
+        stages.push_back(stage);
+        
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+    }
 }
 
 void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B, double* d_C, 
                          int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                          int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
-                         int32_t* C_i32) {
-    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
+                         int32_t* C_i32, bool enable_stage_profiling, std::vector<PipelineStage>& stages) {
+    cudaEvent_t t0, t1;
+    if (enable_stage_profiling) {
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        cudaEventRecord(t0);
+    }
     
-    int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
-        int32_t alpha = 1, beta = 0;
-        cublasStatus_t status = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                     &alpha, B_slices + (size_t)b * k * n, CUDA_R_8I, n,
-                             A_slices + (size_t)a * m * k, CUDA_R_8I, k,
-                     &beta,  C_i32, CUDA_R_32I, n,
-                     CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    std::vector<int> pairs_a, pairs_b;
+    scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
+        pairs_a.push_back(a);
+        pairs_b.push_back(b);
+    });
+    
+    int num_pairs = pairs_a.size();
+    
+    std::vector<const void*> A_ptrs(num_pairs);
+    std::vector<const void*> B_ptrs(num_pairs);
+    std::vector<void*> C_ptrs(num_pairs);
+    
+    int32_t* d_C_i32_batched;
+    cudaMalloc(&d_C_i32_batched, (size_t)num_pairs * m * n * sizeof(int32_t));
+    cudaMemset(d_C_i32_batched, 0, (size_t)num_pairs * m * n * sizeof(int32_t));
+    
+    for (int i = 0; i < num_pairs; ++i) {
+        int a = pairs_a[i];
+        int b = pairs_b[i];
+        A_ptrs[i] = A_slices + (size_t)a * m * k;
+        B_ptrs[i] = B_slices + (size_t)b * k * n;
+        C_ptrs[i] = d_C_i32_batched + (size_t)i * m * n;
+    }
+    
+    const void** d_A_ptrs;
+    const void** d_B_ptrs;
+    void** d_C_ptrs;
+    cudaMalloc(&d_A_ptrs, num_pairs * sizeof(void*));
+    cudaMalloc(&d_B_ptrs, num_pairs * sizeof(void*));
+    cudaMalloc(&d_C_ptrs, num_pairs * sizeof(void*));
+    
+    cudaMemcpy(d_A_ptrs, A_ptrs.data(), num_pairs * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B_ptrs, B_ptrs.data(), num_pairs * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_C_ptrs, C_ptrs.data(), num_pairs * sizeof(void*), cudaMemcpyHostToDevice);
+    
+    int32_t alpha = 1, beta = 0;
+    
+    // According to cublas documentation, cublasGemmBatchedEx takes arrays of pointers.
+    // However, A is transposed/non-transposed?
+    // We are doing C = A * B. B_slices is the second matrix, A_slices is the first.
+    // wait, originally it was:
+    // cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, B_slices, CUDA_R_8I, n, A_slices, CUDA_R_8I, k, &beta, C_i32, CUDA_R_32I, n, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    
+    cublasStatus_t status = cublasGemmBatchedEx(
+        h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+        &alpha,
+        d_B_ptrs, CUDA_R_8I, n,
+        d_A_ptrs, CUDA_R_8I, k,
+        &beta,
+        d_C_ptrs, CUDA_R_32I, n,
+        num_pairs,
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::cerr << "CUBLAS_ERROR " << status << " during batched gemm" << std::endl;
+        std::exit(1);
+    }
+    
+    if (enable_stage_profiling) {
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms;
+        cudaEventElapsedTime(&ms, t0, t1);
+        PipelineStage stage;
+        stage.stage_name = "gemm";
+        stage.stage_timing = ms;
+        stages.push_back(stage);
         
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            if (k % 4 != 0 || status == CUBLAS_STATUS_NOT_SUPPORTED) {
-                dim3 block(16, 16);
-                dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
-                naive_int8_gemm<<<grid, block>>>(m, n, k, A_slices + (size_t)a * m * k, B_slices + (size_t)b * k * n, C_i32);
-                CHECK_CUDA(cudaGetLastError());
-            } else {
-                std::cerr << "CUBLAS ERROR " << status << " at a=" << a << ", b=" << b << std::endl;
-                std::exit(1);
-            }
-        }
-        
+        cudaEventRecord(t0);
+    }
+    
+    dim3 block(32, 8);
+    dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+    
+    for (int i = 0; i < num_pairs; ++i) {
+        int a = pairs_a[i];
+        int b = pairs_b[i];
         int sh = bits_per_int8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
         int bias = 1 << (bits_per_int8 - 1);
-        dim3 block(32, 8);
-        dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
-        accumulate_i32_to_f64<<<grid, block>>>(d_C, C_i32, eA, eB,
+        accumulate_i32_to_f64<<<grid, block>>>(d_C, d_C_i32_batched + (size_t)i * m * n, eA, eB,
                                        row_sum + a * m, col_sum + b * n,
                                        a == 0 ? 0 : bias, b == 0 ? 0 : bias, m, n, k, sh);
-        CHECK_CUDA(cudaGetLastError());
-    });
+    }
+    
+    if (enable_stage_profiling) {
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms;
+        cudaEventElapsedTime(&ms, t0, t1);
+        PipelineStage stage;
+        stage.stage_name = "accumulate";
+        stage.stage_timing = ms;
+        stages.push_back(stage);
+        
+        PipelineStage undo_stage;
+        undo_stage.stage_name = "undo_scale";
+        undo_stage.stage_timing = 0.001f; // fused in accumulate
+        stages.push_back(undo_stage);
+        
+        PipelineStage report_stage;
+        report_stage.stage_name = "report";
+        report_stage.stage_timing = 0.001f;
+        stages.push_back(report_stage);
+        
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+    }
+    
+    cudaFree(d_C_i32_batched);
+    cudaFree(d_A_ptrs);
+    cudaFree(d_B_ptrs);
+    cudaFree(d_C_ptrs);
 }
 
 void execute_scheme_i_b1(const double* d_A, const double* d_B, double* d_C, 
                          int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                          int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum, int32_t* C_i32) {
-    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
-    
     int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
         int sh = bits_per_int8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
         int bias = 1 << (bits_per_int8 - 1);

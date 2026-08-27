@@ -40,9 +40,14 @@ int main(int argc, char** argv) {
     int M = 512, N = 512, K = 512;
     ExecutionMode mode = ExecutionMode::Phase22;
     int num_moduli = 15;
+    int num_split = 0;
+    int bits_per_int8 = 0;
+    bool allow_fallback = false;
     int target_mantissa_bits = 53;
     int repeat = 1;
     bool enable_stage_profiling = false;
+    bool skip_scalA = false;
+    std::string policy_str = "Fixed";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -53,6 +58,14 @@ int main(int argc, char** argv) {
             else if (mode_str == "SchemeII") mode = ExecutionMode::SchemeII;
         } else if (arg == "--num_moduli" && i + 1 < argc) {
             num_moduli = std::atoi(argv[++i]);
+        } else if (arg == "--num_split" && i + 1 < argc) {
+            num_split = std::atoi(argv[++i]);
+        } else if (arg == "--bits_per_int8" && i + 1 < argc) {
+            bits_per_int8 = std::atoi(argv[++i]);
+        } else if (arg == "--allow_fallback") {
+            allow_fallback = true;
+        } else if (arg == "--precision_policy" && i + 1 < argc) {
+            policy_str = argv[++i];
         } else if (arg == "--target_mantissa_bits" && i + 1 < argc) {
             target_mantissa_bits = std::atoi(argv[++i]);
         } else if (arg == "-M" && i + 1 < argc) {
@@ -65,6 +78,8 @@ int main(int argc, char** argv) {
             repeat = std::atoi(argv[++i]);
         } else if (arg == "--stage") {
             enable_stage_profiling = true;
+        } else if (arg == "--skip_scalA") {
+            skip_scalA = true;
         }
     }
 
@@ -94,17 +109,43 @@ int main(int argc, char** argv) {
 
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
+    CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
     const double alpha = 1.0, beta = 0.0;
     
-    // row-major C=A*B -> column-major C^T = B^T * A^T
+    cudaEvent_t start_fp64, stop_fp64;
+    cudaEventCreate(&start_fp64);
+    cudaEventCreate(&stop_fp64);
+    
+    // warm up
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N);
+    
+    cudaEventRecord(start_fp64);
     CHECK_CUBLAS(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
+    cudaEventRecord(stop_fp64);
+    cudaEventSynchronize(stop_fp64);
+    
+    float fp64_ms = 0;
+    cudaEventElapsedTime(&fp64_ms, start_fp64, stop_fp64);
+    std::cout << "Native cuBLAS FP64 Time: " << fp64_ms << " ms\n";
+    
     CHECK_CUDA(cudaMemcpy(h_reference.data(), d_C, M * N * sizeof(double), cudaMemcpyDeviceToHost));
 
     OzakiConfig config;
     config.mode = mode;
     config.scheme_ii_num_moduli = num_moduli;
+    config.scheme_i_num_split = num_split;
+    config.scheme_i_bits_per_int8 = bits_per_int8;
     config.target_mantissa_bits = target_mantissa_bits;
     config.enable_stage_profiling = enable_stage_profiling;
+    config.enable_skip_scalA = skip_scalA;
+    config.allow_native_fp64_fallback = allow_fallback;
+    
+    if (policy_str == "Auto" || (mode == ExecutionMode::SchemeI && num_split == 0) || (mode == ExecutionMode::SchemeII && num_moduli == 0)) {
+        config.precision_policy = PrecisionPolicy::Auto;
+    } else {
+        config.precision_policy = PrecisionPolicy::Fixed;
+    }
+
     if (mode == ExecutionMode::SchemeI) {
         config.scheme_i_mantissa_bits = target_mantissa_bits;
         config.scheme_i_triangular = false;
@@ -132,6 +173,13 @@ int main(int argc, char** argv) {
     std::cout << "padding_rms_error: 0.0" << std::endl;
     std::cout << "target_mantissa_bits=" << target_mantissa_bits << std::endl;
 
+    auto plan = engine.getSchemePlan();
+    std::cout << "\nSchemePlan {\n"
+              << "  num_split: " << plan.num_split << "\n"
+              << "  bits_per_int8: " << plan.bits_per_int8 << "\n"
+              << "  num_moduli: " << plan.num_moduli << "\n"
+              << "}\n";
+
     auto contract = engine.getPrecisionContract();
     std::cout << "\nPrecisionContract {\n"
               << "  mode: \"" << contract.mode << "\"\n"
@@ -156,5 +204,8 @@ int main(int argc, char** argv) {
     CHECK_CUBLAS(cublasDestroy(handle));
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
 
+    if (max_rel_error > 1e-6) {
+        return 1;
+    }
     return 0;
 }

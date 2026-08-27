@@ -60,6 +60,7 @@ __device__ __forceinline__ void ldmatrix_x2_int8(uint32_t* d, void* smem_ptr) {
 
 AdaptiveOzakiEngine::AdaptiveOzakiEngine(const OzakiConfig& config) : config_(config) {
     cublasCreate(&cublas_handle_);
+    cublasSetMathMode(cublas_handle_, CUBLAS_PEDANTIC_MATH);
 }
 AdaptiveOzakiEngine::~AdaptiveOzakiEngine() { 
     freeWorkspace(); 
@@ -1337,19 +1338,47 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
     }
     
     if (config_.mode == ExecutionMode::SchemeI) {
-        current_plan_.num_split = config_.scheme_i_num_split;
-        current_plan_.bits_per_int8 = config_.scheme_i_bits_per_int8;
-        int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
-        
-        if (current_plan_.bits_per_int8 <= 0) {
-            int auto_bits = (int)floor((31.0 - log2((double)k)) / 2.0);
-            current_plan_.bits_per_int8 = std::max(4, std::min(auto_bits, 8));
+        if (config_.precision_policy == PrecisionPolicy::Auto) {
+            int target_bits = config_.target_mantissa_bits;
+            int bits = (int)floor((31.0 - log2((double)k)) / 2.0);
+            bits = std::max(4, std::min(bits, 8));
+            int num_split = (target_bits + bits - 1) / bits;
+            current_plan_.num_split = num_split;
+            current_plan_.bits_per_int8 = bits;
+        } else {
+            current_plan_.num_split = config_.scheme_i_num_split;
+            current_plan_.bits_per_int8 = config_.scheme_i_bits_per_int8;
+            int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
+            
+            if (current_plan_.bits_per_int8 <= 0) {
+                int auto_bits = (int)floor((31.0 - log2((double)k)) / 2.0);
+                current_plan_.bits_per_int8 = std::max(4, std::min(auto_bits, 8));
+            }
+            if (current_plan_.num_split <= 0) {
+                if (mbits > 0) {
+                    current_plan_.num_split = (mbits + current_plan_.bits_per_int8 - 1) / current_plan_.bits_per_int8;
+                } else {
+                    current_contract_.failure_reason = "scheme_i_mantissa_bits must be > 0";
+                    return;
+                }
+            }
         }
-        if (current_plan_.num_split <= 0) {
-            if (mbits > 0) {
-                current_plan_.num_split = (mbits + current_plan_.bits_per_int8 - 1) / current_plan_.bits_per_int8;
+        
+        bool condition_A = (current_plan_.num_split * current_plan_.bits_per_int8 < config_.target_mantissa_bits);
+        if (condition_A) {
+            if (config_.allow_native_fp64_fallback) {
+                double alpha = 1.0, beta = 0.0;
+                cublasDgemm(cublas_handle_, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, dB, n, dA, k, &beta, dC, n);
+                current_contract_.native_fp64_used = true;
+                current_contract_.failure_reason = "condition_A: num_splitxbits < target_mantissa_bits";
+                current_contract_.num_split = current_plan_.num_split;
+                current_contract_.bits_per_int8 = current_plan_.bits_per_int8;
+                return;
             } else {
-                current_contract_.failure_reason = "scheme_i_mantissa_bits must be > 0";
+                current_contract_.native_fp64_used = false;
+                current_contract_.failure_reason = "condition_A: num_splitxbits < target_mantissa_bits; fallback not allowed";
+                current_contract_.num_split = current_plan_.num_split;
+                current_contract_.bits_per_int8 = current_plan_.bits_per_int8;
                 return;
             }
         }
@@ -1380,6 +1409,15 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
             }
         }
         
+        int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
+        
+        scheme_i_pack(dA, dB, dC, m, n, k, mbits,
+                      current_plan_.num_split, current_plan_.bits_per_int8,
+                      d_A_slices, d_B_slices, d_maxA, d_maxB,
+                      d_eA, d_eB, d_row_sum, d_col_sum,
+                      config_.enable_skip_scalA, scalA_cached_, config_.scheme_i_fused,
+                      config_.enable_stage_profiling, current_contract_.stages, 0);
+        
         if (config_.scheme_i_fused) {
             execute_scheme_i_fused(dA, dB, dC, m, n, k, mbits,
                                    current_plan_.num_split, current_plan_.bits_per_int8,
@@ -1389,7 +1427,8 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
             execute_scheme_i_v0(cublas_handle_, dA, dB, dC, m, n, k, mbits,
                                 current_plan_.num_split, current_plan_.bits_per_int8,
                                 config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
-                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32);
+                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32,
+                                config_.enable_stage_profiling, current_contract_.stages);
         } else {
             execute_scheme_i_b1(dA, dB, dC, m, n, k, mbits,
                                 current_plan_.num_split, current_plan_.bits_per_int8,
@@ -1434,14 +1473,54 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         
         return;
     } else if (config_.mode == ExecutionMode::SchemeII) {
-        current_plan_.num_moduli = config_.scheme_ii_num_moduli;
+        if (config_.precision_policy == PrecisionPolicy::Auto) {
+            int target_bits = config_.target_mantissa_bits;
+            int required_crt_bits = target_bits * 2 + (int)ceil(log2((double)k));
+            double log2_prod = 0.0;
+            const int32_t MODULI_INT8[20] = {127, 113, 109, 107, 103, 101, 97, 89, 83, 79, 73, 71, 67, 61, 59, 53, 47, 43, 41, 37};
+            current_plan_.num_moduli = 20;
+            for (int i = 0; i < 20; ++i) {
+                log2_prod += log2((double)MODULI_INT8[i]);
+                if (log2_prod >= required_crt_bits) {
+                    current_plan_.num_moduli = i + 1;
+                    break;
+                }
+            }
+        } else {
+            current_plan_.num_moduli = config_.scheme_ii_num_moduli;
+        }
+
+        double log2_prod = 0.0;
+        const int32_t MODULI_INT8[20] = {127, 113, 109, 107, 103, 101, 97, 89, 83, 79, 73, 71, 67, 61, 59, 53, 47, 43, 41, 37};
+        for (int i = 0; i < current_plan_.num_moduli && i < 20; ++i) {
+            log2_prod += log2((double)MODULI_INT8[i]);
+        }
+        int required_crt_bits = config_.target_mantissa_bits * 2 + (int)ceil(log2((double)k));
+        bool condition_B = (log2_prod < required_crt_bits);
+        
+        if (condition_B) {
+            if (config_.allow_native_fp64_fallback) {
+                double alpha = 1.0, beta = 0.0;
+                cublasDgemm(cublas_handle_, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, dB, n, dA, k, &beta, dC, n);
+                current_contract_.native_fp64_used = true;
+                current_contract_.failure_reason = "condition_B: log2_prod < required_crt_bits";
+                current_contract_.num_moduli = current_plan_.num_moduli;
+                return;
+            } else {
+                current_contract_.native_fp64_used = false;
+                current_contract_.failure_reason = "condition_B: log2_prod < required_crt_bits; fallback not allowed";
+                current_contract_.num_moduli = current_plan_.num_moduli;
+                return;
+            }
+        }
+        
         if (current_plan_.num_moduli < 2 || current_plan_.num_moduli > 20) {
             current_contract_.failure_reason = "scheme_ii_num_moduli must be between 2 and 20";
             return;
         }
         current_contract_.num_moduli = current_plan_.num_moduli;
         
-        execute_scheme_ii_gpu(cublas_handle_, dA, dB, dC, m, n, k, config_.scheme_ii_num_moduli);
+        execute_scheme_ii_gpu(cublas_handle_, dA, dB, dC, m, n, k, current_plan_.num_moduli);
         return;
     }
 
