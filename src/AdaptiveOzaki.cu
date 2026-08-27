@@ -1,5 +1,7 @@
 #include "AdaptiveOzaki.h"
 #include "scheme_i.h"
+#include "scheme_ii.h"
+#include "scheme_ii_gpu.h"
 #include "mma_sm89.cuh"
 #include <iostream>
 #include <cmath>
@@ -94,7 +96,13 @@ void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
             cudaMalloc(&d_global_work_queue, sizeof(int));
         }
     } else {
-        int p = (config_.scheme_i_mantissa_bits + 1 + 7) / 8;
+        int p = config_.scheme_i_num_split;
+        if (p <= 0) {
+            int auto_bits = (int)floor((31.0 - log2((double)k)) / 2.0);
+            int b = std::max(4, std::min(auto_bits, 8));
+            int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
+            p = (mbits + b - 1) / b;
+        }
         size_t bytes_A = (size_t)p * m * k * sizeof(int8_t);
         size_t bytes_B = (size_t)p * k * n * sizeof(int8_t);
         size_t bytes_C32 = (size_t)m * n * sizeof(int32_t);
@@ -159,7 +167,13 @@ size_t AdaptiveOzakiEngine::workspaceBytes() const {
     size_t total = 0;
     
     if (config_.mode == ExecutionMode::SchemeI) {
-        int p = (config_.scheme_i_mantissa_bits + 1 + 7) / 8;
+        int p = config_.scheme_i_num_split;
+        if (p <= 0) {
+            int auto_bits = (int)floor((31.0 - log2((double)ws_k_)) / 2.0);
+            int b = std::max(4, std::min(auto_bits, 8));
+            int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
+            p = (mbits + b - 1) / b;
+        }
         total += (size_t)p * ws_m_ * ws_k_ * sizeof(int8_t);
         total += (size_t)p * ws_k_ * ws_n_ * sizeof(int8_t);
         total += (size_t)ws_m_ * ws_n_ * sizeof(int32_t);
@@ -1291,26 +1305,143 @@ __global__ void hybrid_ozaki_persistent_kernel(
     }
 }
 
-void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, int m, int n, int k) {
+void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, const GEMMInput& input) {
+    // Basic wrapper, no beta/transpose handling yet except failing if needed
+    if (input.op_A != "N" || input.op_B != "N") {
+        current_contract_.failure_reason = "Transpose not supported yet";
+        return;
+    }
+    if (input.beta != 0.0) {
+        current_contract_.failure_reason = "Non-zero beta not supported yet";
+        return;
+    }
+    execute(dA, dB, dC, input.M, input.N, input.K);
+}
 
+void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, int m, int n, int k) {
+    current_contract_.mode = (config_.mode == ExecutionMode::SchemeI) ? "SchemeI" : 
+                             (config_.mode == ExecutionMode::SchemeII) ? "SchemeII" : 
+                             (config_.mode == ExecutionMode::Phase22) ? "Phase22" : "Phase24ExtremeMix";
+    current_contract_.target_mantissa_bits = config_.target_mantissa_bits;
+    current_contract_.native_fp64_used = false;
+    current_contract_.residual_enabled = false;
+    current_contract_.failure_reason = "";
+    
+    // workspace check
+    if (workspaceBytes() == 0 && workspace_allocated_ == false) {
+        // try to allocate, if it fails, or if it was 0 requested
+        if (m == 0 || n == 0 || k == 0) {
+            current_contract_.failure_reason = "workspace=0";
+            return;
+        }
+    }
+    
     if (config_.mode == ExecutionMode::SchemeI) {
+        current_plan_.num_split = config_.scheme_i_num_split;
+        current_plan_.bits_per_int8 = config_.scheme_i_bits_per_int8;
+        int mbits = config_.scheme_i_mantissa_bits > 0 ? config_.scheme_i_mantissa_bits : config_.target_mantissa_bits;
+        
+        if (current_plan_.bits_per_int8 <= 0) {
+            int auto_bits = (int)floor((31.0 - log2((double)k)) / 2.0);
+            current_plan_.bits_per_int8 = std::max(4, std::min(auto_bits, 8));
+        }
+        if (current_plan_.num_split <= 0) {
+            if (mbits > 0) {
+                current_plan_.num_split = (mbits + current_plan_.bits_per_int8 - 1) / current_plan_.bits_per_int8;
+            } else {
+                current_contract_.failure_reason = "scheme_i_mantissa_bits must be > 0";
+                return;
+            }
+        }
+        
+        // build pair schedule
+        std::string pair_sched = "";
+        int num_split = current_plan_.num_split;
+        for (int sum = 2; sum <= num_split + 1; ++sum) {
+            for (int j = 1; j <= sum - 1; ++j) {
+                if (j <= num_split && (sum - j) <= num_split) {
+                    if (config_.scheme_i_pair_threshold == -1 || sum <= config_.scheme_i_pair_threshold + 2) {
+                        if (!pair_sched.empty()) pair_sched += ", ";
+                        pair_sched += "(" + std::to_string(j) + "," + std::to_string(sum - j) + ")";
+                    }
+                }
+            }
+        }
+        current_plan_.pair_schedule = pair_sched;
+        current_contract_.num_split = current_plan_.num_split;
+        current_contract_.bits_per_int8 = current_plan_.bits_per_int8;
+        
         if (!workspace_allocated_ || ws_mode_ != config_.mode || ws_m_ != m || ws_n_ != n || ws_k_ != k) {
-            allocateWorkspace(m, n, k);
+            try {
+                allocateWorkspace(m, n, k);
+            } catch (const std::exception& e) {
+                current_contract_.failure_reason = "workspace allocation failed";
+                return;
+            }
         }
         
         if (config_.scheme_i_fused) {
-            execute_scheme_i_fused(dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+            execute_scheme_i_fused(dA, dB, dC, m, n, k, mbits,
+                                   current_plan_.num_split, current_plan_.bits_per_int8,
                                    config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
-                                   d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum);
+                                   d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32);
         } else if (config_.scheme_i_use_cublas_int8) {
-            execute_scheme_i_v0(cublas_handle_, dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+            execute_scheme_i_v0(cublas_handle_, dA, dB, dC, m, n, k, mbits,
+                                current_plan_.num_split, current_plan_.bits_per_int8,
                                 config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
                                 d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32);
         } else {
-            execute_scheme_i_b1(dA, dB, dC, m, n, k, config_.scheme_i_mantissa_bits,
+            execute_scheme_i_b1(dA, dB, dC, m, n, k, mbits,
+                                current_plan_.num_split, current_plan_.bits_per_int8,
                                 config_.scheme_i_triangular, config_.scheme_i_pair_threshold,
-                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum);
+                                d_A_slices, d_B_slices, d_maxA, d_maxB, d_eA, d_eB, d_row_sum, d_col_sum, d_C_i32);
         }
+        
+        // --- Precision gate block for M2 ---
+        cudaDeviceSynchronize();
+        if (config_.target_mantissa_bits > 0) {
+            double* C_ref;
+            cudaMalloc(&C_ref, m * n * sizeof(double));
+            cudaMemset(C_ref, 0, m * n * sizeof(double));
+            double alpha = 1.0, beta = 0.0;
+            cublasDgemm(cublas_handle_, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, dB, n, dA, k, &beta, C_ref, n);
+            cudaDeviceSynchronize();
+            
+            double* h_C = new double[m * n];
+            double* h_C_ref = new double[m * n];
+            cudaMemcpy(h_C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_C_ref, C_ref, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+            
+            double max_rel_err = 0.0;
+            for (int i = 0; i < m * n; ++i) {
+                if (h_C_ref[i] != 0.0) {
+                    double err = std::abs(h_C[i] - h_C_ref[i]) / std::abs(h_C_ref[i]);
+                    if (err > max_rel_err) max_rel_err = err;
+                } else if (h_C[i] != 0.0) {
+                    max_rel_err = std::numeric_limits<double>::infinity();
+                }
+            }
+            
+            current_contract_.max_relative_error = max_rel_err;
+            // 4096 is our dimension, an acceptable cuBLAS_Ozaki_err heuristic or just check against 1e-6/1e-10
+            double target_err = (config_.target_mantissa_bits >= 53) ? 1e-10 : 1e-6;
+            current_contract_.passed_precision_gate = (max_rel_err <= target_err);
+            
+            delete[] h_C;
+            delete[] h_C_ref;
+            cudaFree(C_ref);
+        }
+        
+        return;
+    } else if (config_.mode == ExecutionMode::SchemeII) {
+        current_plan_.num_moduli = config_.scheme_ii_num_moduli;
+        if (current_plan_.num_moduli < 2 || current_plan_.num_moduli > 20) {
+            current_contract_.failure_reason = "scheme_ii_num_moduli must be between 2 and 20";
+            return;
+        }
+        current_contract_.num_moduli = current_plan_.num_moduli;
+        
+        execute_scheme_ii_gpu(cublas_handle_, dA, dB, dC, m, n, k, config_.scheme_ii_num_moduli);
         return;
     }
 

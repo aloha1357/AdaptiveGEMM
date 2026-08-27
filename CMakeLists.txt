@@ -70,11 +70,22 @@ set(SCHEME_I_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_i.cu")
 set(SCHEME_I_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_i.cu.obj")
 adaptive_nvcc_cu_obj("${SCHEME_I_CU}" "${SCHEME_I_OBJ}")
 
+set(SCHEME_I_FUSED_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_i_fused.cu")
+set(SCHEME_I_FUSED_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_i_fused.cu.obj")
+adaptive_nvcc_cu_obj("${SCHEME_I_FUSED_CU}" "${SCHEME_I_FUSED_OBJ}")
+
+set(SCHEME_II_GPU_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_ii_gpu.cu")
+set(SCHEME_II_GPU_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_ii_gpu.cu.obj")
+adaptive_nvcc_cu_obj("${SCHEME_II_GPU_CU}" "${SCHEME_II_GPU_OBJ}")
+
 add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
     "${INT8GEMM_OBJ}"
     "${SCHEME_I_OBJ}"
+    "${SCHEME_I_FUSED_OBJ}"
+    "${SCHEME_II_GPU_OBJ}"
     "${ADAPTIVEGEMM_ROOT}/src/bench_int8.cpp"
+    "${ADAPTIVEGEMM_ROOT}/src/scheme_ii_plan.cpp"
 )
 
 set_target_properties(adaptive_gemm PROPERTIES
@@ -142,6 +153,19 @@ target_link_libraries(adaptive_gemm_precision_test
 )
 
 add_test(NAME precision COMMAND adaptive_gemm_precision_test)
+
+add_executable(adaptive_gemm_precision_contract_test
+    tests/precision_contract_test.cpp
+)
+
+target_link_libraries(adaptive_gemm_precision_contract_test
+    PRIVATE
+        adaptive_gemm
+        CUDA::cublas
+        CUDA::cudart
+)
+
+add_test(NAME precision_contract COMMAND adaptive_gemm_precision_contract_test)
 
 add_executable(adaptive_gemm_int8_test
     tests/int8_gemm_test.cpp

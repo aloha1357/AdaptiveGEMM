@@ -1,4 +1,4 @@
-﻿#include "int8_gemm.h"
+#include "int8_gemm.h"
 #include "scheme_i.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -48,7 +48,7 @@ __global__ void scheme_i_exponents_from_max(const double* maxAbs, int32_t* e, in
 }
 
 __global__ void scheme_i_write_slices_A(const double* A, const int32_t* eA,
-    int8_t* slices, int32_t* row_sum, int m, int k, int p, int mantissa_bits) {
+    int8_t* slices, int32_t* row_sum, int m, int k, int p, int mantissa_bits, int bits_per_int8) {
     
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < m) {
@@ -65,10 +65,12 @@ __global__ void scheme_i_write_slices_A(const double* A, const int32_t* eA,
             for (int a = 0; a < p; ++a) {
                 int8_t S;
                 if (a == 0) {
-                    S = (int8_t)(q >> (8 * (p - 1)));
+                    S = (int8_t)(q >> (bits_per_int8 * (p - 1)));
                 } else {
-                    int u = (q >> (8 * (p - 1 - a))) & 0xFF;
-                    S = (int8_t)(u - 128);
+                    int mask = (1 << bits_per_int8) - 1;
+                    int bias = 1 << (bits_per_int8 - 1);
+                    int u = (q >> (bits_per_int8 * (p - 1 - a))) & mask;
+                    S = (int8_t)(u - bias);
                 }
                 slices[(size_t)a * m * k + (size_t)row * k + col] = S;
                 sum[a] += S;
@@ -79,7 +81,7 @@ __global__ void scheme_i_write_slices_A(const double* A, const int32_t* eA,
 }
 
 __global__ void scheme_i_write_slices_B(const double* B, const int32_t* eB,
-    int8_t* slices, int32_t* col_sum, int k, int n, int p, int mantissa_bits) {
+    int8_t* slices, int32_t* col_sum, int k, int n, int p, int mantissa_bits, int bits_per_int8) {
     
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col < n) {
@@ -96,10 +98,12 @@ __global__ void scheme_i_write_slices_B(const double* B, const int32_t* eB,
             for (int b = 0; b < p; ++b) {
                 int8_t S;
                 if (b == 0) {
-                    S = (int8_t)(q >> (8 * (p - 1)));
+                    S = (int8_t)(q >> (bits_per_int8 * (p - 1)));
                 } else {
-                    int u = (q >> (8 * (p - 1 - b))) & 0xFF;
-                    S = (int8_t)(u - 128);
+                    int mask = (1 << bits_per_int8) - 1;
+                    int bias = 1 << (bits_per_int8 - 1);
+                    int u = (q >> (bits_per_int8 * (p - 1 - b))) & mask;
+                    S = (int8_t)(u - bias);
                 }
                 slices[(size_t)b * k * n + (size_t)row * n + col] = S;
                 sum[b] += S;
@@ -145,7 +149,7 @@ __global__ void naive_int8_gemm(int m, int n, int k, const int8_t* A, const int8
 }
 
 void scheme_i_pack(const double* d_A, const double* d_B, double* d_C, 
-                   int m, int n, int k, int mantissa_bits, int p,
+                   int m, int n, int k, int mantissa_bits, int p, int bits_per_int8,
                    int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                    int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {
     cudaMemsetAsync(d_C, 0, (size_t)m * n * sizeof(double), 0);
@@ -166,19 +170,18 @@ void scheme_i_pack(const double* d_A, const double* d_B, double* d_C,
     scheme_i_exponents_from_max<<<(n + threads - 1) / threads, threads>>>(maxB, eB, n);
     CHECK_CUDA(cudaGetLastError());
     
-    scheme_i_write_slices_A<<<(m + threads - 1) / threads, threads>>>(d_A, eA, A_slices, row_sum, m, k, p, mantissa_bits);
+    scheme_i_write_slices_A<<<(m + threads - 1) / threads, threads>>>(d_A, eA, A_slices, row_sum, m, k, p, mantissa_bits, bits_per_int8);
     CHECK_CUDA(cudaGetLastError());
-    scheme_i_write_slices_B<<<(n + threads - 1) / threads, threads>>>(d_B, eB, B_slices, col_sum, k, n, p, mantissa_bits);
+    scheme_i_write_slices_B<<<(n + threads - 1) / threads, threads>>>(d_B, eB, B_slices, col_sum, k, n, p, mantissa_bits, bits_per_int8);
     CHECK_CUDA(cudaGetLastError());
 }
 
 void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B, double* d_C, 
-                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                         int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                          int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
                          int32_t* C_i32) {
-    int p = (mantissa_bits + 1 + 7) / 8; // ceil((mantissaBitCount + 1) / 8)
-    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
+    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
     
     int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
         int32_t alpha = 1, beta = 0;
@@ -200,30 +203,26 @@ void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B,
             }
         }
         
-        int sh = 8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
+        int sh = bits_per_int8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
+        int bias = 1 << (bits_per_int8 - 1);
         dim3 block(32, 8);
         dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
         accumulate_i32_to_f64<<<grid, block>>>(d_C, C_i32, eA, eB,
                                        row_sum + a * m, col_sum + b * n,
-                                       a == 0 ? 0 : 128, b == 0 ? 0 : 128, m, n, k, sh);
+                                       a == 0 ? 0 : bias, b == 0 ? 0 : bias, m, n, k, sh);
         CHECK_CUDA(cudaGetLastError());
     });
 }
 
 void execute_scheme_i_b1(const double* d_A, const double* d_B, double* d_C, 
-                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                         int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {
-    int p = (mantissa_bits + 1 + 7) / 8;
-    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
-    
-    int32_t* C_i32 = nullptr;
-    if (k % 64 != 0) {
-        cudaMallocAsync(&C_i32, (size_t)m * n * sizeof(int32_t), 0);
-    }
+                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum, int32_t* C_i32) {
+    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
     
     int launched = scheme_i_for_each_pair(p, triangular, T, [&](int a, int b) {
-        int sh = 8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
+        int sh = bits_per_int8 * ((p - 1 - a) + (p - 1 - b)) - 2 * mantissa_bits;
+        int bias = 1 << (bits_per_int8 - 1);
         if (k % 64 != 0) {
             dim3 block(16, 16);
             dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
@@ -232,24 +231,17 @@ void execute_scheme_i_b1(const double* d_A, const double* d_B, double* d_C,
             dim3 g2((n + b2.x - 1) / b2.x, (m + b2.y - 1) / b2.y);
             accumulate_i32_to_f64<<<g2, b2>>>(d_C, C_i32, eA, eB,
                                            row_sum + a * m, col_sum + b * n,
-                                           a == 0 ? 0 : 128, b == 0 ? 0 : 128, m, n, k, sh);
+                                           a == 0 ? 0 : bias, b == 0 ? 0 : bias, m, n, k, sh);
         } else {
             int8_gemm_s8s8s32_f64_epilogue(
                 A_slices + (size_t)a * m * k, B_slices + (size_t)b * k * n, d_C, eA, eB,
                 row_sum + a * m, col_sum + b * n,
-                a == 0 ? 0 : 128, b == 0 ? 0 : 128, m, n, k, sh, 0);
+                a == 0 ? 0 : bias, b == 0 ? 0 : bias, m, n, k, sh, 0);
         }
     });
-
-    if (C_i32) {
-        cudaFreeAsync(C_i32, 0);
-    }
 }
 
-void execute_scheme_i_fused(const double* d_A, const double* d_B, double* d_C, 
-                            int m, int n, int k, int mantissa_bits, bool triangular, int T,
-                            int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                            int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum) {}
+
 
 void launch_scheme_i_reduce_maxB(const double* B, double* maxB, int k, int n) {
     dim3 gridB((n + 31) / 32, (k + 31) / 32);

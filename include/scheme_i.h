@@ -16,20 +16,20 @@ inline int scheme_i_for_each_pair(int p, bool triangular, int T,
 }
 
 void execute_scheme_i_v0(cublasHandle_t h, const double* d_A, const double* d_B, double* d_C, 
-                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                         int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                          int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum,
                          int32_t* C_i32);
 
 void execute_scheme_i_b1(const double* d_A, const double* d_B, double* d_C, 
-                         int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                         int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                          int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum);
+                         int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum, int32_t* C_i32);
 
 void execute_scheme_i_fused(const double* d_A, const double* d_B, double* d_C, 
-                            int m, int n, int k, int mantissa_bits, bool triangular, int T,
+                            int m, int n, int k, int mantissa_bits, int p, int bits_per_int8, bool triangular, int T,
                             int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
-                            int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum);
+                            int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum, int32_t* C_i32);
 
 // test helpers
 void launch_scheme_i_reduce_maxB(const double* B, double* maxB, int k, int n);
