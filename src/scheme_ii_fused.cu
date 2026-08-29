@@ -374,9 +374,19 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
         cudaMemcpy(d_primes, h_Mg, launches * sizeof(int32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_inv_table, h_inv_g, 400 * sizeof(int32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_P, h_Pg, launches * sizeof(Int192), cudaMemcpyHostToDevice);
-        scheme_ii_combine_partial_crt_kernel<<<gridC, block2d, 0, stream>>>(
-            reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
-            d_primes, d_inv_table, M, M_half, d_P);
+        if (launches == 4) {
+            scheme_ii_combine_partial_crt_fixed_kernel<4><<<gridC, block2d, 0, stream>>>(
+                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, S,
+                d_primes, d_inv_table, M, M_half, d_P);
+        } else if (launches == 8) {
+            scheme_ii_combine_partial_crt_fixed_kernel<8><<<gridC, block2d, 0, stream>>>(
+                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, S,
+                d_primes, d_inv_table, M, M_half, d_P);
+        } else {
+            scheme_ii_combine_partial_crt_kernel<<<gridC, block2d, 0, stream>>>(
+                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
+                d_primes, d_inv_table, M, M_half, d_P);
+        }
     } else {
         fused_crt_reconstruct_kernel<<<gridC, block2d, 0, stream>>>(
             d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, num_moduli, S, d_primes, d_inv_table, M, M_half, d_P);

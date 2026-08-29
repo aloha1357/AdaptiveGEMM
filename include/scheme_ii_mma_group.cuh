@@ -503,6 +503,50 @@ __global__ void scheme_ii_combine_partial_crt_kernel(
     C[(size_t)i * n + j] = C_int * scheme_ii_pow2i_fast(-exp_sum);
 }
 
+template <int NumGroups>
+__global__ void scheme_ii_combine_partial_crt_fixed_kernel(
+    const uint32_t* __restrict__ C_partial,
+    double* __restrict__ C,
+    const int* __restrict__ eA,
+    const int* __restrict__ eB,
+    int m, int n, int m_pad, int n_pad,
+    int S,
+    const int32_t* __restrict__ group_moduli,
+    const int32_t* __restrict__ inv_table,
+    Int192 M, Int192 M_half,
+    const Int192* __restrict__ P)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+
+    uint32_t v[NumGroups];
+    #pragma unroll
+    for (int g = 0; g < NumGroups; ++g) {
+        uint32_t Mg = (uint32_t)group_moduli[g];
+        uint32_t r = C_partial[(size_t)g * m_pad * n_pad + i * n_pad + j];
+        v[g] = r % Mg;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NumGroups - 1; ++g) {
+        uint32_t v_ii = v[g];
+        #pragma unroll
+        for (int h = g + 1; h < NumGroups; ++h) {
+            uint32_t Mg = (uint32_t)group_moduli[h];
+            long long diff = (long long)v[h] - (long long)v_ii;
+            diff %= (long long)Mg;
+            if (diff < 0) diff += Mg;
+            uint32_t inv = (uint32_t)inv_table[g * 20 + h];
+            v[h] = (uint32_t)(((unsigned long long)diff * inv) % Mg);
+        }
+    }
+
+    double C_int = scheme_ii_crt_to_double(v, NumGroups, P, M, M_half);
+    int exp_sum = 2 * S - eA[i] - eB[j];
+    C[(size_t)i * n + j] = C_int * scheme_ii_pow2i_fast(-exp_sum);
+}
+
 inline cudaError_t scheme_ii_launch_grouped_mma(
     const int8_t* A, const int8_t* B, int32_t* C,
     int m, int n, int k, int n_group, int group_size,
