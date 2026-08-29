@@ -1,0 +1,533 @@
+#pragma once
+
+#include "mma_sm89.cuh"
+#include "scheme_ii_int192.h"
+
+#include <cuda_runtime.h>
+#include <cstdint>
+
+namespace ozaki {
+
+__device__ __forceinline__ int scheme_ii_reduce_mod(int acc, int p) {
+    int r = acc % p;
+    if (r < 0) r += p;
+    return r;
+}
+
+__device__ __forceinline__ void scheme_ii_garner_inplace(
+    int* v, const int32_t* primes, int n, const int32_t* inv_table, int p_base) {
+    for (int i = 0; i < n - 1; ++i) {
+        int v_ii = v[i];
+        for (int j = i + 1; j < n; ++j) {
+            int p = primes[p_base + j];
+            long long diff = (long long)v[j] - v_ii;
+            diff %= p;
+            if (diff < 0) diff += p;
+            int inv = inv_table[(p_base + i) * 20 + (p_base + j)];
+            v[j] = (int)((diff * (long long)inv) % p);
+        }
+    }
+}
+
+__device__ __forceinline__ uint64_t scheme_ii_mixradix_u64(
+    const int* v, const int32_t* primes, int n, int p_base) {
+    uint64_t X = 0;
+    uint64_t P = 1;
+    for (int i = 0; i < n; ++i) {
+        X += (uint64_t)(uint32_t)v[i] * P;
+        P *= (uint32_t)primes[p_base + i];
+    }
+    return X;
+}
+
+__device__ __forceinline__ void scheme_ii_int192_sub(Int192& out, const Int192& a, const Int192& b) {
+    uint64_t borrow = 0;
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) {
+        long long d = (long long)a.limbs[i] - (long long)borrow - (long long)b.limbs[i];
+        if (d < 0) {
+            d += 4294967296LL;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.limbs[i] = (uint32_t)d;
+    }
+}
+
+__device__ __forceinline__ double scheme_ii_crt_to_double(
+    const uint32_t* v, int n, const Int192* P, Int192 M, Int192 M_half) {
+    Int192 X;
+    for (int i = 0; i < n; ++i) {
+        X.add_mul_scalar(P[i], v[i]);
+    }
+    bool is_neg = X.is_greater_than(M_half);
+    if (is_neg) {
+        Int192 diff;
+        scheme_ii_int192_sub(diff, M, X);
+        X = diff;
+    }
+    double out = X.to_double();
+    if (is_neg) out = -out;
+    return out;
+}
+
+// Sequential grouped INT8 MMA. GroupSize moduli per launch, 128x128 tiles.
+// PartialCRT=false: write C_mod for each modulus.
+// PartialCRT=true: Garner the group and write one uint32 plane (C mod M_g).
+template <int GroupSize, bool PartialCRT>
+__global__ void scheme_ii_grouped_mma_kernel(
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    int32_t* __restrict__ C,
+    int m, int n, int k,
+    int n_group,
+    const int32_t* __restrict__ primes,
+    const int32_t* __restrict__ inv_table,
+    int group_base)
+{
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int Stages = 3;
+
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lane = tid % 32;
+    int wm = wid / 2;
+    int wn = wid % 2;
+
+    int bm_off = blockIdx.y * BM;
+    int bn_off = blockIdx.x * BN;
+
+    extern __shared__ int8_t smem[];
+    int8_t* sA_ptr = smem;
+    int8_t* sB_ptr = smem + Stages * BM * 128;
+
+    auto swizzle_A = [](int row, int col) {
+        return col ^ ((row & 7) << 4);
+    };
+    auto swizzle_B = [](int row, int col) {
+        return col ^ (((row & 3) ^ ((row >> 4) & 3)) << 4);
+    };
+
+    int residues[PartialCRT ? GroupSize : 1][PartialCRT ? (BM / 64) : 1][PartialCRT ? (BN / 16) : 1][PartialCRT ? 4 : 1];
+
+    for (int g = 0; g < n_group; ++g) {
+        const int8_t* A_g = A + (size_t)g * m * k;
+        const int8_t* B_g = B + (size_t)g * k * n;
+
+        uint32_t a_frag[2][BM / 64][4];
+        uint32_t b_frag[2][BN / 16][2];
+        int32_t acc[BM / 64][BN / 16][4];
+        #pragma unroll
+        for (int i = 0; i < BM / 64; ++i)
+            #pragma unroll
+            for (int j = 0; j < BN / 16; ++j)
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) acc[i][j][t] = 0;
+
+        auto load_a_smem = [&](int buf, int k_offset) {
+            int8_t* sA = sA_ptr + buf * BM * 128;
+            for (int i = tid; i < BM * BK / 16; i += 256) {
+                int row = (i * 16) / BK;
+                int col = (i * 16) % BK;
+                int gm = bm_off + row;
+                int gk = k_offset + col;
+                if (gm < m && gk < k) {
+                    cp_async_16(&sA[row * 128 + swizzle_A(row, col)], &A_g[(size_t)gm * k + gk]);
+                }
+            }
+        };
+        auto load_b_smem = [&](int buf, int k_offset) {
+            int8_t* sB = sB_ptr + buf * BN * 64;
+            for (int i = tid; i < BK * BN / 16; i += 256) {
+                int row = (i * 16) / BN;
+                int col = (i * 16) % BN;
+                int gk = k_offset + row;
+                int gn = bn_off + col;
+                if (gk < k && gn < n) {
+                    int4 v = *(int4*)&B_g[(size_t)gk * n + gn];
+                    int8_t* bytes = (int8_t*)&v;
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        sB[(col + j) * 64 + swizzle_B(col + j, row)] = bytes[j];
+                    }
+                }
+            }
+        };
+        auto load_a_frag = [&](int buf, int k_step, int fbuf) {
+            int8_t* sA = sA_ptr + buf * BM * 128;
+            int ms = wm * (BM / 4);
+            #pragma unroll
+            for (int i = 0; i < BM / 64; i++) {
+                int a_row = ms + i * 16 + (lane % 16);
+                int a_col = k_step + (lane / 16) * 16;
+                uint32_t addr = __cvta_generic_to_shared(&sA[a_row * 128 + swizzle_A(a_row, a_col)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(a_frag[fbuf][i][0]), "=r"(a_frag[fbuf][i][1]),
+                      "=r"(a_frag[fbuf][i][2]), "=r"(a_frag[fbuf][i][3])
+                    : "r"(addr));
+            }
+        };
+        auto load_b_frag = [&](int buf, int k_step, int fbuf) {
+            int8_t* sB = sB_ptr + buf * BN * 64;
+            int ns = wn * (BN / 2);
+            #pragma unroll
+            for (int j = 0; j < BN / 16; j++) {
+                int b_row = ns + j * 8 + (lane % 8);
+                int b_col = k_step + (lane / 8 % 2) * 16;
+                uint32_t addr = __cvta_generic_to_shared(&sB[b_row * 64 + swizzle_B(b_row, b_col)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                    : "=r"(b_frag[fbuf][j][0]), "=r"(b_frag[fbuf][j][1])
+                    : "r"(addr));
+            }
+        };
+
+        int prefetch_k = 0;
+        for (int p = 0; p < Stages - 1; ++p) {
+            if (prefetch_k < k) {
+                load_a_smem(p, prefetch_k);
+                load_b_smem(p, prefetch_k);
+                cp_async_commit();
+                prefetch_k += BK;
+            }
+        }
+        cp_async_wait<0>();
+        __syncthreads();
+
+        int read_stage = 0;
+        int k1 = 0;
+        if (0 < k) {
+            load_a_frag(read_stage, k1, 0);
+            load_b_frag(read_stage, k1, 0);
+        }
+
+        for (int ck = 0; ck < k; ck += 32) {
+            int p = (ck / 32) % 2;
+            int next_k1 = k1 + 32;
+            int next_stage = read_stage;
+            bool fetch_next_stage = false;
+            if (next_k1 >= BK) {
+                next_k1 = 0;
+                next_stage = (read_stage + 1);
+                if (next_stage >= Stages) next_stage = 0;
+                fetch_next_stage = true;
+            }
+            bool do_prefetch = (ck + 32 < k);
+            if (fetch_next_stage && prefetch_k < k) {
+                int write_stage = (next_stage + Stages - 2) % Stages;
+                load_a_smem(write_stage, prefetch_k);
+                load_b_smem(write_stage, prefetch_k);
+                cp_async_commit();
+                prefetch_k += BK;
+            }
+            if (next_k1 == 0 && do_prefetch) {
+                cp_async_wait<Stages - 2>();
+                __syncthreads();
+            }
+            if (do_prefetch) {
+                load_a_frag(next_stage, next_k1, p ^ 1);
+                load_b_frag(next_stage, next_k1, p ^ 1);
+            }
+            #pragma unroll
+            for (int i = 0; i < BM / 64; i++) {
+                #pragma unroll
+                for (int j = 0; j < BN / 16; j++) {
+                    mma_m16n8k32_s8(acc[i][j], a_frag[p][i], b_frag[p][j], acc[i][j]);
+                }
+            }
+            k1 = next_k1;
+            read_stage = next_stage;
+        }
+
+        const int r_off[2] = { lane / 4, lane / 4 + 8 };
+        const int c_off = (lane % 4) * 2;
+        int pmod = primes[group_base + g];
+
+        if constexpr (PartialCRT) {
+            #pragma unroll
+            for (int i = 0; i < BM / 64; ++i)
+                #pragma unroll
+                for (int j = 0; j < BN / 16; ++j)
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t)
+                        residues[g][i][j][t] = scheme_ii_reduce_mod(acc[i][j][t], pmod);
+        } else {
+            int32_t* C_g = C + (size_t)g * m * n;
+            #pragma unroll
+            for (int i = 0; i < BM / 64; ++i) {
+                #pragma unroll
+                for (int j = 0; j < BN / 16; ++j) {
+                    #pragma unroll
+                    for (int r = 0; r < 2; ++r) {
+                        int gm = bm_off + wm * (BM / 4) + i * 16 + r_off[r];
+                        int gn = bn_off + wn * (BN / 2) + j * 8 + c_off;
+                        if (gm < m && gn < n) {
+                            int2 v;
+                            v.x = acc[i][j][r * 2];
+                            v.y = acc[i][j][r * 2 + 1];
+                            *(int2*)&C_g[(size_t)gm * n + gn] = v;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr (PartialCRT) {
+        const int r_off[2] = { lane / 4, lane / 4 + 8 };
+        const int c_off = (lane % 4) * 2;
+        #pragma unroll
+        for (int i = 0; i < BM / 64; ++i) {
+            #pragma unroll
+            for (int j = 0; j < BN / 16; ++j) {
+                #pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    int gm = bm_off + wm * (BM / 4) + i * 16 + r_off[r];
+                    int gn = bn_off + wn * (BN / 2) + j * 8 + c_off;
+                    if (gm < m && gn < n) {
+                        #pragma unroll
+                        for (int c = 0; c < 2; ++c) {
+                            if (gn + c >= n) break;
+                            int v[GroupSize];
+                            #pragma unroll
+                            for (int g = 0; g < GroupSize; ++g) {
+                                v[g] = (g < n_group) ? residues[g][i][j][r * 2 + c] : 0;
+                            }
+                            scheme_ii_garner_inplace(v, primes, n_group, inv_table, group_base);
+                            uint64_t X = scheme_ii_mixradix_u64(v, primes, n_group, group_base);
+                            C[(size_t)gm * n + gn + c] = (int32_t)(uint32_t)X;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Small-tile true fused kernel: 64x16 output tile, 4 values/thread, all moduli, write double C.
+__global__ void scheme_ii_true_fused_kernel(
+    const int8_t* __restrict__ A_mods,
+    const int8_t* __restrict__ B_mods,
+    double* __restrict__ C,
+    const int* __restrict__ eA,
+    const int* __restrict__ eB,
+    int m, int n, int k,
+    int m_pad, int n_pad, int k_pad,
+    int num_moduli, int S,
+    const int32_t* __restrict__ primes,
+    const int32_t* __restrict__ inv_table,
+    Int192 M, Int192 M_half,
+    const Int192* __restrict__ P)
+{
+    constexpr int BM = 64;
+    constexpr int BN = 16;
+    constexpr int BK = 64;
+
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lane = tid % 32;
+    int wm = wid / 2;
+    int wn = wid % 2;
+
+    int bm_off = blockIdx.y * BM;
+    int bn_off = blockIdx.x * BN;
+    if (bm_off >= m || bn_off >= n) return;
+
+    extern __shared__ int8_t smem[];
+    int8_t* sA = smem;
+    int8_t* sB = smem + BM * 128;
+
+    auto swizzle_A = [](int row, int col) {
+        return col ^ ((row & 7) << 4);
+    };
+    auto swizzle_B = [](int row, int col) {
+        return col ^ (((row & 3) ^ ((row >> 4) & 3)) << 4);
+    };
+
+    int residues[20][4];
+
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        const int8_t* A = A_mods + (size_t)p_idx * m_pad * k_pad;
+        const int8_t* B = B_mods + (size_t)p_idx * k_pad * n_pad;
+        int32_t acc[4] = {0, 0, 0, 0};
+
+        for (int ko = 0; ko < k_pad; ko += BK) {
+            for (int i = tid; i < BM * BK / 16; i += 256) {
+                int row = (i * 16) / BK;
+                int col = (i * 16) % BK;
+                int gm = bm_off + row;
+                int gk = ko + col;
+                if (gm < m_pad && gk < k_pad) {
+                    cp_async_16(&sA[row * 128 + swizzle_A(row, col)], &A[(size_t)gm * k_pad + gk]);
+                }
+            }
+            for (int i = tid; i < BK * BN / 16; i += 256) {
+                int row = (i * 16) / BN;
+                int col = (i * 16) % BN;
+                int gk = ko + row;
+                int gn = bn_off + col;
+                if (gk < k_pad && gn < n_pad) {
+                    int4 v = *(int4*)&B[(size_t)gk * n_pad + gn];
+                    int8_t* bytes = (int8_t*)&v;
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        sB[(col + j) * 64 + swizzle_B(col + j, row)] = bytes[j];
+                    }
+                }
+            }
+            cp_async_commit();
+            cp_async_wait<0>();
+            __syncthreads();
+
+            for (int k1 = 0; k1 < BK; k1 += 32) {
+                uint32_t a_frag[4], b_frag[2];
+                int a_row = wm * 16 + (lane % 16);
+                int a_col = k1 + (lane / 16) * 16;
+                uint32_t addr_a = __cvta_generic_to_shared(&sA[a_row * 128 + swizzle_A(a_row, a_col)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                    : "r"(addr_a));
+                int b_row = wn * 8 + (lane % 8);
+                int b_col = k1 + (lane / 8 % 2) * 16;
+                uint32_t addr_b = __cvta_generic_to_shared(&sB[b_row * 64 + swizzle_B(b_row, b_col)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                    : "=r"(b_frag[0]), "=r"(b_frag[1])
+                    : "r"(addr_b));
+                mma_m16n8k32_s8(acc, a_frag, b_frag, acc);
+            }
+            __syncthreads();
+        }
+
+        int p = primes[p_idx];
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) residues[p_idx][t] = scheme_ii_reduce_mod(acc[t], p);
+    }
+
+    const int r_off[2] = { lane / 4, lane / 4 + 8 };
+    const int c_off = (lane % 4) * 2;
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        #pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            int gm = bm_off + wm * 16 + r_off[r];
+            int gn = bn_off + wn * 8 + c_off + c;
+            if (gm < m && gn < n) {
+                int vg[20];
+                uint32_t vu[20];
+                for (int p_idx = 0; p_idx < num_moduli; ++p_idx) vg[p_idx] = residues[p_idx][r * 2 + c];
+                scheme_ii_garner_inplace(vg, primes, num_moduli, inv_table, 0);
+                for (int p_idx = 0; p_idx < num_moduli; ++p_idx) vu[p_idx] = (uint32_t)vg[p_idx];
+                double C_int = scheme_ii_crt_to_double(vu, num_moduli, P, M, M_half);
+                int exp_sum = 2 * S - eA[gm] - eB[gn];
+                C[(size_t)gm * n + gn] = C_int * ldexp(1.0, -exp_sum);
+            }
+        }
+    }
+}
+
+__global__ void scheme_ii_combine_partial_crt_kernel(
+    const int32_t* __restrict__ C_partial,
+    double* __restrict__ C,
+    const int* __restrict__ eA,
+    const int* __restrict__ eB,
+    int m, int n, int m_pad, int n_pad,
+    int num_groups, int S,
+    const int32_t* __restrict__ group_moduli,
+    const int32_t* __restrict__ inv_table,
+    Int192 M, Int192 M_half,
+    const Int192* __restrict__ P)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= m || j >= n) return;
+
+    uint32_t v[20];
+    for (int g = 0; g < num_groups; ++g) {
+        uint32_t Mg = (uint32_t)group_moduli[g];
+        uint32_t r = (uint32_t)C_partial[(size_t)g * m_pad * n_pad + i * n_pad + j];
+        r %= Mg;
+        v[g] = r;
+    }
+
+    for (int g = 0; g < num_groups - 1; ++g) {
+        uint32_t v_ii = v[g];
+        for (int h = g + 1; h < num_groups; ++h) {
+            uint32_t Mg = (uint32_t)group_moduli[h];
+            long long diff = (long long)v[h] - (long long)v_ii;
+            diff %= (long long)Mg;
+            if (diff < 0) diff += Mg;
+            uint32_t inv = (uint32_t)inv_table[g * 20 + h];
+            v[h] = (uint32_t)(((unsigned long long)diff * inv) % Mg);
+        }
+    }
+
+    double C_int = scheme_ii_crt_to_double(v, num_groups, P, M, M_half);
+    int exp_sum = 2 * S - eA[i] - eB[j];
+    C[(size_t)i * n + j] = C_int * ldexp(1.0, -exp_sum);
+}
+
+inline cudaError_t scheme_ii_launch_grouped_mma(
+    const int8_t* A, const int8_t* B, int32_t* C,
+    int m, int n, int k, int n_group, int group_size,
+    const int32_t* primes, const int32_t* inv_table, int group_base,
+    bool partial_crt, cudaStream_t stream)
+{
+    if (m % 128 != 0 || n % 128 != 0 || k % 64 != 0) return cudaErrorInvalidValue;
+    constexpr int BM = 128, BN = 128, BK = 64, Stages = 3;
+    dim3 block(256);
+    dim3 grid(n / BN, m / BM);
+    int smem_size = Stages * BM * 128 + Stages * BN * 64;
+
+    if (partial_crt) {
+        if (group_size >= 4) {
+            auto* fn = scheme_ii_grouped_mma_kernel<4, true>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            fn<<<grid, block, smem_size, stream>>>(
+                A, B, C, m, n, k, n_group, primes, inv_table, group_base);
+        } else {
+            auto* fn = scheme_ii_grouped_mma_kernel<2, true>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            fn<<<grid, block, smem_size, stream>>>(
+                A, B, C, m, n, k, n_group, primes, inv_table, group_base);
+        }
+    } else {
+        if (group_size >= 4) {
+            auto* fn = scheme_ii_grouped_mma_kernel<4, false>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            fn<<<grid, block, smem_size, stream>>>(
+                A, B, C, m, n, k, n_group, primes, inv_table, group_base);
+        } else {
+            auto* fn = scheme_ii_grouped_mma_kernel<2, false>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            fn<<<grid, block, smem_size, stream>>>(
+                A, B, C, m, n, k, n_group, primes, inv_table, group_base);
+        }
+    }
+    return cudaGetLastError();
+}
+
+inline cudaError_t scheme_ii_launch_true_fused(
+    const int8_t* A_mods, const int8_t* B_mods, double* C,
+    const int* eA, const int* eB,
+    int m, int n, int k, int m_pad, int n_pad, int k_pad,
+    int num_moduli, int S,
+    const int32_t* primes, const int32_t* inv_table,
+    Int192 M, Int192 M_half, const Int192* P,
+    cudaStream_t stream)
+{
+    if (m_pad % 64 != 0 || n_pad % 16 != 0 || k_pad % 64 != 0) return cudaErrorInvalidValue;
+    constexpr int BM = 64, BN = 16;
+    dim3 block(256);
+    dim3 grid(n_pad / BN, m_pad / BM);
+    int smem_size = BM * 128 + BN * 64;
+    cudaFuncSetAttribute(scheme_ii_true_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    scheme_ii_true_fused_kernel<<<grid, block, smem_size, stream>>>(
+        A_mods, B_mods, C, eA, eB, m, n, k, m_pad, n_pad, k_pad,
+        num_moduli, S, primes, inv_table, M, M_half, P);
+    return cudaGetLastError();
+}
+
+} // namespace ozaki

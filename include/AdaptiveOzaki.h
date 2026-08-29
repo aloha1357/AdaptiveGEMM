@@ -34,6 +34,11 @@ enum class PrecisionPolicy {
     NativeFallback
 };
 
+enum class SchemeIIGemmBackend {
+    CuBLAS,
+    CustomMMA
+};
+
 struct PipelineStage {
     std::string stage_name;
     double stage_timing = 0.0;
@@ -63,6 +68,11 @@ struct PrecisionContract {
     bool used_cuda_graph = false;
     bool used_true_fused_kernel = false;
     bool used_scheme_ii_fused = false;
+    bool used_custom_mma = false;
+    std::string scheme_ii_backend = "";
+    int scheme_ii_group_size = 0;
+    int scheme_ii_gemm_launches = 0;
+    bool used_partial_crt_epilogue = false;
     std::vector<PipelineStage> stages;
 };
 
@@ -97,6 +107,7 @@ struct OzakiConfig {
     bool scheme_ii_use_batched_gemm = true;
     bool scheme_ii_use_cuda_graph = false;
     bool scheme_ii_use_true_fused_kernel = false;
+    SchemeIIGemmBackend scheme_ii_gemm_backend = SchemeIIGemmBackend::CuBLAS;
     int scheme_ii_moduli_group_size = 4;
     bool enable_stage_profiling = false;
 
@@ -209,6 +220,7 @@ public:
     const double* d_scheme_ii_graph_A = nullptr;
     const double* d_scheme_ii_graph_B = nullptr;
     double* d_scheme_ii_graph_C = nullptr;
+    bool d_scheme_ii_graph_custom_mma = false;
 private:
     int ws_m_ = 0, ws_n_ = 0, ws_k_ = 0;
     ExecutionMode ws_mode_ = ExecutionMode::Phase22;

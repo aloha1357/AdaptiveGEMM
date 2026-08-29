@@ -61,6 +61,9 @@ function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
             "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_gpu.h"
             "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_moduli.h"
             "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_int192.h"
+            "${ADAPTIVEGEMM_ROOT}/include/int8_gemm.h"
+            "${ADAPTIVEGEMM_ROOT}/include/mma_sm89.cuh"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_mma_group.cuh"
         COMMENT "Compiling ${CU_FILE} with nvcc"
         VERBATIM
     )

@@ -143,6 +143,7 @@ static void destroy_scheme_ii_graph_state(AdaptiveOzakiEngine* engine) {
     engine->d_scheme_ii_graph_A = nullptr;
     engine->d_scheme_ii_graph_B = nullptr;
     engine->d_scheme_ii_graph_C = nullptr;
+    engine->d_scheme_ii_graph_custom_mma = false;
 }
 
 __device__ __forceinline__ void ldmatrix_x4_int8(uint32_t* d, void* smem_ptr) {
@@ -172,7 +173,11 @@ void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     if (config_.mode == ExecutionMode::SchemeII || config_.mode == ExecutionMode::SchemeII_Fused) {
         int m_pad = ((m + 127) / 128) * 128;
         int n_pad = ((n + 127) / 128) * 128;
-        int k_pad = ((k + 31) / 32) * 32;
+        // Custom MMA requires k % 64 == 0 (BK=64). Size fused workspace for that
+        // so either cuBLAS or custom MMA can run from the same buffers.
+        int k_pad = (config_.mode == ExecutionMode::SchemeII_Fused)
+                        ? ((k + 63) / 64) * 64
+                        : ((k + 31) / 32) * 32;
         int num_moduli = std::max(current_plan_.num_moduli, config_.scheme_ii_num_moduli);
         if (num_moduli < 2) num_moduli = 15;
         if (num_moduli > 20) num_moduli = 20;
@@ -1474,6 +1479,11 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
     current_contract_.used_cuda_graph = false;
     current_contract_.used_true_fused_kernel = false;
     current_contract_.used_scheme_ii_fused = false;
+    current_contract_.used_custom_mma = false;
+    current_contract_.scheme_ii_backend = "";
+    current_contract_.scheme_ii_group_size = 0;
+    current_contract_.scheme_ii_gemm_launches = 0;
+    current_contract_.used_partial_crt_epilogue = false;
     current_contract_.passed_precision_gate = false;
     current_contract_.max_relative_error = -1.0;
     current_contract_.stages.clear();
@@ -1723,6 +1733,8 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
         execute_scheme_ii_gpu(cublas_handle_, dA, dB, dC, m, n, k, current_plan_.num_moduli);
         return;
     } else if (config_.mode == ExecutionMode::SchemeII_Fused) {
+        current_contract_.scheme_ii_backend =
+            (config_.scheme_ii_gemm_backend == SchemeIIGemmBackend::CustomMMA) ? "custom_mma" : "cublas";
         current_plan_.num_moduli = scheme_ii_choose_num_moduli(
             k, config_.target_mantissa_bits, config_.scheme_ii_num_moduli, config_.precision_policy);
         current_contract_.num_moduli = current_plan_.num_moduli;

@@ -1,6 +1,8 @@
 #include "scheme_ii_fused.h"
 #include "scheme_ii_int192.h"
 #include "scheme_ii_moduli.h"
+#include "scheme_ii_mma_group.cuh"
+#include "int8_gemm.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -30,6 +32,23 @@ static int fused_mod_inverse(int a, int m) {
     }
     if (x < 0) x += m0;
     return x;
+}
+
+static uint32_t fused_mod_inverse_u32(uint32_t a, uint32_t m) {
+    int64_t t = 0, newt = 1;
+    int64_t r = (int64_t)m;
+    int64_t newr = (int64_t)(a % m);
+    while (newr != 0) {
+        int64_t q = r / newr;
+        int64_t tmp = newt;
+        newt = t - q * newt;
+        t = tmp;
+        tmp = newr;
+        newr = r - q * newr;
+        r = tmp;
+    }
+    if (t < 0) t += (int64_t)m;
+    return (uint32_t)t;
 }
 
 static __global__ void fused_compute_exp_A_kernel(const double* A, int* eA, int m, int k) {
@@ -180,19 +199,74 @@ static void destroy_scheme_ii_graph(AdaptiveOzakiEngine* engine) {
         engine->d_scheme_ii_graph = nullptr;
     }
     engine->d_scheme_ii_graph_valid = false;
+    engine->d_scheme_ii_graph_custom_mma = false;
 }
 
 // Host scalars referenced by captured cuBLAS nodes must outlive the graph.
 static int kFusedAlpha = 1;
 static int kFusedBeta = 0;
 
-static void launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
+static bool launch_custom_mma_groups(
+    cudaStream_t stream,
+    int m_pad, int n_pad, int k_pad, int num_moduli, int gsz,
+    int8_t* d_A_mod, int8_t* d_B_mod, int32_t* d_C_mod,
+    int32_t* d_primes, int32_t* d_inv_table,
+    bool partial_crt, int* launches_out)
+{
+    long long stride_B = (long long)k_pad * n_pad;
+    long long stride_A = (long long)m_pad * k_pad;
+    long long stride_C = (long long)m_pad * n_pad;
+    int launches = 0;
+    int p = 0;
+    while (p < num_moduli) {
+        int rem = num_moduli - p;
+        int this_g = rem > gsz ? gsz : rem;
+        if (this_g == 1 && !partial_crt) {
+            cudaError_t st = int8_gemm_s8s8s32(
+                d_A_mod + (size_t)p * stride_A,
+                d_B_mod + (size_t)p * stride_B,
+                d_C_mod + (size_t)p * stride_C,
+                m_pad, n_pad, k_pad, stream);
+            if (st != cudaSuccess) {
+                printf("int8_gemm_s8s8s32 failed with %s at p_idx %d\n", cudaGetErrorString(st), p);
+                return false;
+            }
+            p += 1;
+            launches += 1;
+            continue;
+        }
+        int tmpl = (this_g <= 2) ? 2 : 4;
+        int32_t* C_out = partial_crt ? (d_C_mod + (size_t)launches * stride_C)
+                                    : (d_C_mod + (size_t)p * stride_C);
+        cudaError_t st = scheme_ii_launch_grouped_mma(
+            d_A_mod + (size_t)p * stride_A,
+            d_B_mod + (size_t)p * stride_B,
+            C_out,
+            m_pad, n_pad, k_pad,
+            this_g, tmpl,
+            d_primes, d_inv_table, p,
+            partial_crt, stream);
+        if (st != cudaSuccess) {
+            printf("grouped MMA failed with %s at p_idx %d n_group %d\n",
+                   cudaGetErrorString(st), p, this_g);
+            return false;
+        }
+        p += this_g;
+        launches += 1;
+    }
+    if (launches_out) *launches_out = launches;
+    return true;
+}
+
+static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
                                   const double* d_A, const double* d_B, double* d_C,
                                   int m, int n, int k, int m_pad, int n_pad, int k_pad,
                                   int num_moduli, int S, Int192 M, Int192 M_half,
                                   int32_t* d_primes, int32_t* d_inv_table, Int192* d_P,
                                   int* d_eA, int* d_eB, int8_t* d_A_mod, int8_t* d_B_mod, int32_t* d_C_mod,
-                                  cudaEvent_t* ev, bool profile) {
+                                  cudaEvent_t* ev, bool profile, bool use_custom_mma,
+                                  int group_size, bool use_partial_crt, bool use_true_fused,
+                                  const int32_t* h_primes, int* gemm_launches_out) {
     const int block_size = 256;
     if (profile) cudaEventRecord(ev[0], stream);
     fused_compute_exp_A_kernel<<<(m + block_size - 1) / block_size, block_size, 0, stream>>>(d_A, d_eA, m, k);
@@ -213,28 +287,94 @@ static void launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     long long stride_B = (long long)k_pad * n_pad;
     long long stride_A = (long long)m_pad * k_pad;
     long long stride_C = (long long)m_pad * n_pad;
+    int launches = 0;
 
-    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-        cublasStatus_t st = cublasGemmEx(handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            n_pad, m_pad, k_pad,
-            &kFusedAlpha,
-            d_B_mod + (size_t)p_idx * stride_B, CUDA_R_8I, n_pad,
-            d_A_mod + (size_t)p_idx * stride_A, CUDA_R_8I, k_pad,
-            &kFusedBeta,
-            d_C_mod + (size_t)p_idx * stride_C, CUDA_R_32I, n_pad,
-            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        if (st != CUBLAS_STATUS_SUCCESS) {
-            printf("cublasGemmEx failed with status %d at p_idx %d\n", (int)st, p_idx);
-            return;
+    if (use_true_fused) {
+        cudaError_t st = scheme_ii_launch_true_fused(
+            d_A_mod, d_B_mod, d_C, d_eA, d_eB,
+            m, n, k, m_pad, n_pad, k_pad,
+            num_moduli, S, d_primes, d_inv_table, M, M_half, d_P, stream);
+        if (st != cudaSuccess) {
+            printf("true fused MMA CRT failed with %s\n", cudaGetErrorString(st));
+            return false;
         }
+        launches = 1;
+        if (gemm_launches_out) *gemm_launches_out = launches;
+        if (profile) cudaEventRecord(ev[5], stream);
+        if (profile) cudaEventRecord(ev[6], stream);
+        return true;
     }
+
+    if (use_custom_mma) {
+        int gsz = group_size < 1 ? 1 : group_size;
+        if (gsz > 4) gsz = 4;
+        if (!launch_custom_mma_groups(stream, m_pad, n_pad, k_pad, num_moduli, gsz,
+                                      d_A_mod, d_B_mod, d_C_mod, d_primes, d_inv_table,
+                                      use_partial_crt, &launches)) {
+            return false;
+        }
+    } else {
+        for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+            cublasStatus_t st = cublasGemmEx(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                n_pad, m_pad, k_pad,
+                &kFusedAlpha,
+                d_B_mod + (size_t)p_idx * stride_B, CUDA_R_8I, n_pad,
+                d_A_mod + (size_t)p_idx * stride_A, CUDA_R_8I, k_pad,
+                &kFusedBeta,
+                d_C_mod + (size_t)p_idx * stride_C, CUDA_R_32I, n_pad,
+                CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                printf("cublasGemmEx failed with status %d at p_idx %d\n", (int)st, p_idx);
+                return false;
+            }
+        }
+        launches = num_moduli;
+    }
+    if (gemm_launches_out) *gemm_launches_out = launches;
     if (profile) cudaEventRecord(ev[5], stream);
 
     dim3 gridC((n + 15) / 16, (m + 15) / 16);
-    fused_crt_reconstruct_kernel<<<gridC, block2d, 0, stream>>>(
-        d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, num_moduli, S, d_primes, d_inv_table, M, M_half, d_P);
+    if (use_partial_crt) {
+        int gsz = group_size < 1 ? 1 : group_size;
+        if (gsz > 4) gsz = 4;
+        int32_t h_Mg[20] = {};
+        int32_t h_inv_g[400] = {};
+        Int192 h_Pg[20];
+        int p = 0;
+        for (int g = 0; g < launches; ++g) {
+            int rem = num_moduli - p;
+            int this_g = rem > gsz ? gsz : rem;
+            if (this_g < 1) this_g = 1;
+            uint32_t Mg = 1;
+            for (int i = 0; i < this_g; ++i) Mg *= (uint32_t)h_primes[p + i];
+            h_Mg[g] = (int32_t)Mg;
+            if (g == 0) {
+                h_Pg[0].add(1);
+            } else {
+                h_Pg[g] = h_Pg[g - 1];
+                h_Pg[g].mul((uint32_t)h_Mg[g - 1]);
+            }
+            p += this_g;
+        }
+        for (int g = 0; g < launches; ++g) {
+            for (int h = g + 1; h < launches; ++h) {
+                h_inv_g[g * 20 + h] = (int32_t)fused_mod_inverse_u32(
+                    (uint32_t)h_Mg[g], (uint32_t)h_Mg[h]);
+            }
+        }
+        cudaMemcpy(d_primes, h_Mg, launches * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_inv_table, h_inv_g, 400 * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_P, h_Pg, launches * sizeof(Int192), cudaMemcpyHostToDevice);
+        scheme_ii_combine_partial_crt_kernel<<<gridC, block2d, 0, stream>>>(
+            d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
+            d_primes, d_inv_table, M, M_half, d_P);
+    } else {
+        fused_crt_reconstruct_kernel<<<gridC, block2d, 0, stream>>>(
+            d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, num_moduli, S, d_primes, d_inv_table, M, M_half, d_P);
+    }
     if (profile) cudaEventRecord(ev[6], stream);
+    return true;
 }
 
 void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const double* d_B, double* d_C,
@@ -245,6 +385,10 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     contract.used_true_fused_kernel = false;
     contract.used_cuda_graph = false;
     contract.used_scheme_ii_fused = false;
+    contract.used_custom_mma = false;
+    const bool use_custom_mma = (config.scheme_ii_gemm_backend == SchemeIIGemmBackend::CustomMMA);
+    contract.scheme_ii_backend = use_custom_mma ? "custom_mma" : "cublas";
+    int gemm_launches = 0;
 
     int num_moduli = engine->getSchemePlan().num_moduli;
     if (num_moduli <= 0) num_moduli = config.scheme_ii_num_moduli;
@@ -261,9 +405,28 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
         return;
     }
 
+    int group_size = config.scheme_ii_moduli_group_size;
+    bool use_true_fused = false;
+    bool use_partial_crt = false;
+    if (use_custom_mma && config.scheme_ii_use_true_fused_kernel) {
+        if (group_size <= 0 || group_size >= num_moduli) {
+            use_true_fused = true;
+            group_size = num_moduli;
+        } else {
+            use_partial_crt = true;
+            if (group_size < 2) group_size = 2;
+            if (group_size > 4) group_size = 4;
+        }
+    } else if (use_custom_mma) {
+        if (group_size < 1) group_size = 1;
+        if (group_size > 4) group_size = 4;
+    } else {
+        group_size = 1;
+    }
+
     int m_pad = ((m + 127) / 128) * 128;
     int n_pad = ((n + 127) / 128) * 128;
-    int k_pad = ((k + 31) / 32) * 32;
+    int k_pad = use_custom_mma ? ((k + 63) / 64) * 64 : ((k + 31) / 32) * 32;
 
     int32_t h_primes[20];
     int32_t h_inv_table[400];
@@ -320,7 +483,11 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     }
 
     bool used_graph = false;
-    const bool want_graph = config.scheme_ii_use_cuda_graph && !config.scheme_ii_use_true_fused_kernel;
+    bool pipeline_ok = true;
+    // cudaFuncSetAttribute inside custom MMA is not graph-capturable.
+    const bool want_graph = config.scheme_ii_use_cuda_graph &&
+                            !config.scheme_ii_use_true_fused_kernel &&
+                            !use_custom_mma;
     if (want_graph) {
         bool need_capture =
             !engine->d_scheme_ii_graph_valid ||
@@ -330,7 +497,8 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
             engine->d_scheme_ii_graph_num_moduli != num_moduli ||
             engine->d_scheme_ii_graph_A != d_A ||
             engine->d_scheme_ii_graph_B != d_B ||
-            engine->d_scheme_ii_graph_C != d_C;
+            engine->d_scheme_ii_graph_C != d_C ||
+            engine->d_scheme_ii_graph_custom_mma != use_custom_mma;
 
         if (need_capture) {
             destroy_scheme_ii_graph(engine);
@@ -339,7 +507,9 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
             if (cap_st == cudaSuccess) {
                 launch_fused_pipeline(handle, stream, d_A, d_B, d_C, m, n, k, m_pad, n_pad, k_pad,
                                       num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
-                                      d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, nullptr, false);
+                                      d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, nullptr, false,
+                                      use_custom_mma, group_size, use_partial_crt, use_true_fused,
+                                      h_primes, &gemm_launches);
                 cudaGraph_t graph = nullptr;
                 cap_st = cudaStreamEndCapture(stream, &graph);
                 if (cap_st == cudaSuccess && graph) {
@@ -356,6 +526,7 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
                         engine->d_scheme_ii_graph_A = d_A;
                         engine->d_scheme_ii_graph_B = d_B;
                         engine->d_scheme_ii_graph_C = d_C;
+                        engine->d_scheme_ii_graph_custom_mma = use_custom_mma;
                     } else {
                         if (graph) cudaGraphDestroy(graph);
                         destroy_scheme_ii_graph(engine);
@@ -379,15 +550,19 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     }
 
     if (!used_graph) {
-        launch_fused_pipeline(handle, stream, d_A, d_B, d_C, m, n, k, m_pad, n_pad, k_pad,
-                              num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
-                              d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, ev, profile);
+        pipeline_ok = launch_fused_pipeline(handle, stream, d_A, d_B, d_C, m, n, k, m_pad, n_pad, k_pad,
+                                            num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
+                                            d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, ev, profile,
+                                            use_custom_mma, group_size, use_partial_crt, use_true_fused,
+                                            h_primes, &gemm_launches);
     }
 
     if (profile) {
-        cudaEventSynchronize(ev[6]);
+        if (pipeline_ok) cudaEventSynchronize(ev[6]);
         contract.stages.clear();
-        if (used_graph) {
+        if (!pipeline_ok) {
+            // GEMM failed before the CRT event was recorded.
+        } else if (used_graph) {
             float total = 0;
             cudaEventElapsedTime(&total, ev[0], ev[6]);
             contract.stages.push_back({"scale_exp_A", 0.0, 0});
@@ -419,9 +594,23 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     cudaStreamSynchronize(stream);
     cublasSetStream(handle, 0);
 
+    if (!pipeline_ok) {
+        contract.failure_reason = use_custom_mma
+            ? "custom MMA int8_gemm_s8s8s32 failed"
+            : "cublasGemmEx failed in SchemeII_Fused";
+        contract.used_scheme_ii_fused = false;
+        contract.used_custom_mma = false;
+        return;
+    }
+
     contract.used_scheme_ii_fused = true;
-    contract.used_true_fused_kernel = false;
+    contract.used_true_fused_kernel = use_true_fused;
+    contract.used_partial_crt_epilogue = use_partial_crt;
+    contract.used_custom_mma = use_custom_mma;
     contract.used_cuda_graph = used_graph;
+    contract.scheme_ii_backend = use_custom_mma ? "custom_mma" : "cublas";
+    contract.scheme_ii_group_size = use_true_fused ? num_moduli : group_size;
+    contract.scheme_ii_gemm_launches = gemm_launches;
     contract.num_moduli = num_moduli;
     if (contract.fallback_mode.empty()) contract.fallback_mode = "None";
 }

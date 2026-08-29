@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
     bool use_cuda_graph = false;
     bool use_true_fused_kernel = false;
     std::string policy_str = "Fixed";
+    std::string scheme_ii_backend_str = "cublas";
+    int scheme_ii_group_size = 4;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -106,6 +108,10 @@ int main(int argc, char** argv) {
             use_cuda_graph = true;
         } else if (arg == "--use_true_fused_kernel") {
             use_true_fused_kernel = true;
+        } else if (arg == "--scheme_ii_backend" && i + 1 < argc) {
+            scheme_ii_backend_str = argv[++i];
+        } else if (arg == "--scheme_ii_group_size" && i + 1 < argc) {
+            scheme_ii_group_size = std::atoi(argv[++i]);
         }
     }
 
@@ -155,6 +161,10 @@ int main(int argc, char** argv) {
     config.allow_native_fp64_fallback = allow_fallback;
     config.scheme_ii_use_cuda_graph = use_cuda_graph;
     config.scheme_ii_use_true_fused_kernel = use_true_fused_kernel;
+    config.scheme_ii_gemm_backend = (scheme_ii_backend_str == "custom_mma")
+        ? SchemeIIGemmBackend::CustomMMA
+        : SchemeIIGemmBackend::CuBLAS;
+    config.scheme_ii_moduli_group_size = scheme_ii_group_size;
 
     if (policy_str == "Auto" ||
         (mode == ExecutionMode::SchemeI && num_split == 0) ||
@@ -182,6 +192,8 @@ int main(int argc, char** argv) {
     float fix_emu_ms = -1.0f;
     float schemeII_ms = -1.0f;
     float schemeII_fused_ms = -1.0f;
+    float schemeII_fused_cublas_ms = -1.0f;
+    float schemeII_fused_custom_mma_ms = -1.0f;
 
     if (enable_benchmark) {
         cublasHandle_t handle_emu;
@@ -221,24 +233,53 @@ int main(int argc, char** argv) {
         schemeII_ms = time_engine(engine_ii, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
         engine_ii.freeWorkspace();
 
-        OzakiConfig cfg_fused = config;
-        cfg_fused.mode = ExecutionMode::SchemeII_Fused;
-        AdaptiveOzakiEngine engine_fused(cfg_fused);
-        schemeII_fused_ms = time_engine(engine_fused, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
+        const bool want_custom_mma = (config.scheme_ii_gemm_backend == SchemeIIGemmBackend::CustomMMA);
 
-        CHECK_CUDA(cudaMemcpy(h_result.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
+        OzakiConfig cfg_fused_cublas = config;
+        cfg_fused_cublas.mode = ExecutionMode::SchemeII_Fused;
+        cfg_fused_cublas.scheme_ii_gemm_backend = SchemeIIGemmBackend::CuBLAS;
+        AdaptiveOzakiEngine engine_fused_cublas(cfg_fused_cublas);
+        schemeII_fused_cublas_ms = time_engine(engine_fused_cublas, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
+        PrecisionContract contract_cublas = engine_fused_cublas.getPrecisionContract();
+        if (!want_custom_mma) {
+            CHECK_CUDA(cudaMemcpy(h_result.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
+        }
+        engine_fused_cublas.freeWorkspace();
+
+        OzakiConfig cfg_fused_mma = config;
+        cfg_fused_mma.mode = ExecutionMode::SchemeII_Fused;
+        cfg_fused_mma.scheme_ii_gemm_backend = SchemeIIGemmBackend::CustomMMA;
+        AdaptiveOzakiEngine engine_fused_mma(cfg_fused_mma);
+        schemeII_fused_custom_mma_ms = time_engine(engine_fused_mma, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
+        PrecisionContract contract_mma = engine_fused_mma.getPrecisionContract();
+        if (want_custom_mma) {
+            CHECK_CUDA(cudaMemcpy(h_result.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
+        }
+
+        schemeII_fused_ms = want_custom_mma ? schemeII_fused_custom_mma_ms : schemeII_fused_cublas_ms;
+        PrecisionContract contract = want_custom_mma ? contract_mma : contract_cublas;
+
         double rms_error = 0.0, max_rel_error = 0.0;
         double max_abs_error = compute_max_error(h_reference, h_result, rms_error, max_rel_error);
-        auto contract = engine_fused.getPrecisionContract();
         bool passed = (max_rel_error <= 1e-6) && !contract.native_fp64_used && !contract.residual_enabled;
+        if (want_custom_mma) {
+            passed = passed && contract.used_custom_mma && contract.scheme_ii_backend == "custom_mma";
+        }
 
         std::cout << "cuBLAS 13 dynamic emu Time: " << dyn_emu_ms << " ms\n";
         std::cout << "cuBLAS 13 fixed53 emu Time: " << fix_emu_ms << " ms\n";
         std::cout << "SchemeII Time: " << schemeII_ms << " ms\n";
         std::cout << "SchemeII_Fused Time: " << schemeII_fused_ms << " ms\n";
+        std::cout << "SchemeII_Fused cuBLAS backend Time: " << schemeII_fused_cublas_ms << " ms\n";
+        std::cout << "SchemeII_Fused custom MMA Time: " << schemeII_fused_custom_mma_ms << " ms\n";
         std::cout << "used_cuda_graph=" << (contract.used_cuda_graph ? "true" : "false") << "\n";
         std::cout << "used_true_fused_kernel=" << (contract.used_true_fused_kernel ? "true" : "false") << "\n";
         std::cout << "used_scheme_ii_fused=" << (contract.used_scheme_ii_fused ? "true" : "false") << "\n";
+        std::cout << "used_custom_mma=" << (contract.used_custom_mma ? "true" : "false") << "\n";
+        std::cout << "scheme_ii_backend=" << (contract.scheme_ii_backend.empty() ? "cublas" : contract.scheme_ii_backend) << "\n";
+        std::cout << "scheme_ii_group_size=" << contract.scheme_ii_group_size << "\n";
+        std::cout << "scheme_ii_gemm_launches=" << contract.scheme_ii_gemm_launches << "\n";
+        std::cout << "used_partial_crt_epilogue=" << (contract.used_partial_crt_epilogue ? "true" : "false") << "\n";
         std::cout << "fallback_mode=" << (contract.fallback_mode.empty() ? "None" : contract.fallback_mode) << "\n";
         std::cout << "num_moduli=" << contract.num_moduli << "\n";
         std::cout << "max_abs_error=" << max_abs_error << "\n";
@@ -251,6 +292,9 @@ int main(int argc, char** argv) {
                   << " cublas13_fixed53_emu_ms=" << fix_emu_ms
                   << " schemeII_ms=" << schemeII_ms
                   << " schemeII_fused_ms=" << schemeII_fused_ms
+                  << " schemeII_fused_cublas_backend_ms=" << schemeII_fused_cublas_ms
+                  << " schemeII_fused_custom_mma_ms=" << schemeII_fused_custom_mma_ms
+                  << " schemeII_fused_custom_mma_fallback_mode=" << (contract_mma.fallback_mode.empty() ? "None" : contract_mma.fallback_mode)
                   << " schemeII_fused_fallback_mode=" << (contract.fallback_mode.empty() ? "None" : contract.fallback_mode)
                   << " schemeII_fused_num_moduli=" << contract.num_moduli
                   << " fallback_mode=" << (contract.fallback_mode.empty() ? "None" : contract.fallback_mode)
@@ -260,9 +304,14 @@ int main(int argc, char** argv) {
                   << " passed_precision_gate=" << (passed ? 1 : 0)
                   << " used_cuda_graph=" << (contract.used_cuda_graph ? "true" : "false")
                   << " used_true_fused_kernel=" << (contract.used_true_fused_kernel ? "true" : "false")
+                  << " used_custom_mma=" << (contract.used_custom_mma ? "true" : "false")
+                  << " scheme_ii_backend=" << (contract.scheme_ii_backend.empty() ? "cublas" : contract.scheme_ii_backend)
+                  << " scheme_ii_group_size=" << contract.scheme_ii_group_size
+                  << " scheme_ii_gemm_launches=" << contract.scheme_ii_gemm_launches
+                  << " used_partial_crt_epilogue=" << (contract.used_partial_crt_epilogue ? "true" : "false")
                   << std::endl;
 
-        engine_fused.freeWorkspace();
+        engine_fused_mma.freeWorkspace();
         cudaEventDestroy(start_fp64);
         cudaEventDestroy(stop_fp64);
         CHECK_CUBLAS(cublasDestroy(handle));
@@ -311,6 +360,11 @@ int main(int argc, char** argv) {
               << "  used_cuda_graph: " << (contract.used_cuda_graph ? "true" : "false") << "\n"
               << "  used_true_fused_kernel: " << (contract.used_true_fused_kernel ? "true" : "false") << "\n"
               << "  used_scheme_ii_fused: " << (contract.used_scheme_ii_fused ? "true" : "false") << "\n"
+              << "  used_custom_mma: " << (contract.used_custom_mma ? "true" : "false") << "\n"
+              << "  scheme_ii_backend: \"" << (contract.scheme_ii_backend.empty() ? "cublas" : contract.scheme_ii_backend) << "\"\n"
+              << "  scheme_ii_group_size: " << contract.scheme_ii_group_size << "\n"
+              << "  scheme_ii_gemm_launches: " << contract.scheme_ii_gemm_launches << "\n"
+              << "  used_partial_crt_epilogue: " << (contract.used_partial_crt_epilogue ? "true" : "false") << "\n"
               << "}\n";
 
     if (enable_stage_profiling) {
@@ -326,6 +380,8 @@ int main(int argc, char** argv) {
     std::cout << "fallback_mode=" << (contract.fallback_mode.empty() ? "None" : contract.fallback_mode) << "\n";
     std::cout << "passed_precision_gate=" << (passed_gate ? 1 : 0) << "\n";
     std::cout << "used_cuda_graph=" << (contract.used_cuda_graph ? "true" : "false") << "\n";
+    std::cout << "used_custom_mma=" << (contract.used_custom_mma ? "true" : "false") << "\n";
+    std::cout << "scheme_ii_backend=" << (contract.scheme_ii_backend.empty() ? "cublas" : contract.scheme_ii_backend) << "\n";
 
     CHECK_CUBLAS(cublasDestroy(handle));
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
