@@ -14,9 +14,9 @@
 
 namespace ozaki {
 
-// Staged / semi-fused SchemeII path. Kernels are local copies so this
-// translation unit does not depend on relocatable device code against
-// scheme_ii_gpu.cu. This is not a true register-level fused CRT kernel.
+// SchemeII fused executor. The cuBLAS backend is staged; the M8 custom backend
+// can group moduli, fuse a partial CRT epilogue, or run the all-moduli CRT
+// epilogue in the MMA kernel. A/B residue quantization is still staged.
 
 static int fused_mod_inverse(int a, int m) {
     int m0 = m, y = 0, x = 1;
@@ -49,6 +49,14 @@ static uint32_t fused_mod_inverse_u32(uint32_t a, uint32_t m) {
     }
     if (t < 0) t += (int64_t)m;
     return (uint32_t)t;
+}
+
+__device__ __forceinline__ double fused_pow2i_fast(int e) {
+    int biased = e + 1023;
+    if (biased > 0 && biased < 2047) {
+        return __longlong_as_double((unsigned long long)biased << 52);
+    }
+    return ldexp(1.0, e);
 }
 
 static __global__ void fused_compute_exp_A_kernel(const double* A, int* eA, int m, int k) {
@@ -184,7 +192,7 @@ static __global__ void fused_crt_reconstruct_kernel(const int32_t* __restrict__ 
         if (is_neg) C_int_dbl = -C_int_dbl;
 
         int exp_sum = 2 * S - eA[i] - eB[j];
-        C[(size_t)i * n + j] = C_int_dbl * ldexp(1.0, -exp_sum);
+        C[(size_t)i * n + j] = C_int_dbl * fused_pow2i_fast(-exp_sum);
     }
 }
 
@@ -367,7 +375,7 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
         cudaMemcpy(d_inv_table, h_inv_g, 400 * sizeof(int32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_P, h_Pg, launches * sizeof(Int192), cudaMemcpyHostToDevice);
         scheme_ii_combine_partial_crt_kernel<<<gridC, block2d, 0, stream>>>(
-            d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
+            reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
             d_primes, d_inv_table, M, M_half, d_P);
     } else {
         fused_crt_reconstruct_kernel<<<gridC, block2d, 0, stream>>>(

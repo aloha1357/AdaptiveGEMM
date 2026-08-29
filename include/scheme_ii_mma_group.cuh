@@ -72,10 +72,18 @@ __device__ __forceinline__ double scheme_ii_crt_to_double(
     return out;
 }
 
+__device__ __forceinline__ double scheme_ii_pow2i_fast(int e) {
+    int biased = e + 1023;
+    if (biased > 0 && biased < 2047) {
+        return __longlong_as_double((unsigned long long)biased << 52);
+    }
+    return ldexp(1.0, e);
+}
+
 // Sequential grouped INT8 MMA. GroupSize moduli per launch, 128x128 tiles.
 // PartialCRT=false: write C_mod for each modulus.
 // PartialCRT=true: Garner the group and write one uint32 plane (C mod M_g).
-template <int GroupSize, bool PartialCRT>
+template <int GroupSize, bool PartialCRT, int Stages>
 __global__ void scheme_ii_grouped_mma_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
@@ -89,7 +97,6 @@ __global__ void scheme_ii_grouped_mma_kernel(
     constexpr int BM = 128;
     constexpr int BN = 128;
     constexpr int BK = 64;
-    constexpr int Stages = 3;
 
     int tid = threadIdx.x;
     int wid = tid / 32;
@@ -298,7 +305,8 @@ __global__ void scheme_ii_grouped_mma_kernel(
                             }
                             scheme_ii_garner_inplace(v, primes, n_group, inv_table, group_base);
                             uint64_t X = scheme_ii_mixradix_u64(v, primes, n_group, group_base);
-                            C[(size_t)gm * n + gn + c] = (int32_t)(uint32_t)X;
+                            uint32_t* C_u32 = reinterpret_cast<uint32_t*>(C);
+                            C_u32[(size_t)gm * n + gn + c] = (uint32_t)X;
                         }
                     }
                 }
@@ -422,14 +430,14 @@ __global__ void scheme_ii_true_fused_kernel(
                 for (int p_idx = 0; p_idx < num_moduli; ++p_idx) vu[p_idx] = (uint32_t)vg[p_idx];
                 double C_int = scheme_ii_crt_to_double(vu, num_moduli, P, M, M_half);
                 int exp_sum = 2 * S - eA[gm] - eB[gn];
-                C[(size_t)gm * n + gn] = C_int * ldexp(1.0, -exp_sum);
+                C[(size_t)gm * n + gn] = C_int * scheme_ii_pow2i_fast(-exp_sum);
             }
         }
     }
 }
 
 __global__ void scheme_ii_combine_partial_crt_kernel(
-    const int32_t* __restrict__ C_partial,
+    const uint32_t* __restrict__ C_partial,
     double* __restrict__ C,
     const int* __restrict__ eA,
     const int* __restrict__ eB,
@@ -447,7 +455,7 @@ __global__ void scheme_ii_combine_partial_crt_kernel(
     uint32_t v[20];
     for (int g = 0; g < num_groups; ++g) {
         uint32_t Mg = (uint32_t)group_moduli[g];
-        uint32_t r = (uint32_t)C_partial[(size_t)g * m_pad * n_pad + i * n_pad + j];
+        uint32_t r = C_partial[(size_t)g * m_pad * n_pad + i * n_pad + j];
         r %= Mg;
         v[g] = r;
     }
@@ -466,7 +474,7 @@ __global__ void scheme_ii_combine_partial_crt_kernel(
 
     double C_int = scheme_ii_crt_to_double(v, num_groups, P, M, M_half);
     int exp_sum = 2 * S - eA[i] - eB[j];
-    C[(size_t)i * n + j] = C_int * ldexp(1.0, -exp_sum);
+    C[(size_t)i * n + j] = C_int * scheme_ii_pow2i_fast(-exp_sum);
 }
 
 inline cudaError_t scheme_ii_launch_grouped_mma(
@@ -476,31 +484,32 @@ inline cudaError_t scheme_ii_launch_grouped_mma(
     bool partial_crt, cudaStream_t stream)
 {
     if (m % 128 != 0 || n % 128 != 0 || k % 64 != 0) return cudaErrorInvalidValue;
-    constexpr int BM = 128, BN = 128, BK = 64, Stages = 3;
+    constexpr int BM = 128, BN = 128, Stages = 3, PartialStages = 2;
     dim3 block(256);
     dim3 grid(n / BN, m / BM);
     int smem_size = Stages * BM * 128 + Stages * BN * 64;
+    int partial_smem_size = PartialStages * BM * 128 + PartialStages * BN * 64;
 
     if (partial_crt) {
         if (group_size >= 4) {
-            auto* fn = scheme_ii_grouped_mma_kernel<4, true>;
-            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-            fn<<<grid, block, smem_size, stream>>>(
+            auto* fn = scheme_ii_grouped_mma_kernel<4, true, PartialStages>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, partial_smem_size);
+            fn<<<grid, block, partial_smem_size, stream>>>(
                 A, B, C, m, n, k, n_group, primes, inv_table, group_base);
         } else {
-            auto* fn = scheme_ii_grouped_mma_kernel<2, true>;
-            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-            fn<<<grid, block, smem_size, stream>>>(
+            auto* fn = scheme_ii_grouped_mma_kernel<2, true, PartialStages>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, partial_smem_size);
+            fn<<<grid, block, partial_smem_size, stream>>>(
                 A, B, C, m, n, k, n_group, primes, inv_table, group_base);
         }
     } else {
         if (group_size >= 4) {
-            auto* fn = scheme_ii_grouped_mma_kernel<4, false>;
+            auto* fn = scheme_ii_grouped_mma_kernel<4, false, Stages>;
             cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
             fn<<<grid, block, smem_size, stream>>>(
                 A, B, C, m, n, k, n_group, primes, inv_table, group_base);
         } else {
-            auto* fn = scheme_ii_grouped_mma_kernel<2, false>;
+            auto* fn = scheme_ii_grouped_mma_kernel<2, false, Stages>;
             cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
             fn<<<grid, block, smem_size, stream>>>(
                 A, B, C, m, n, k, n_group, primes, inv_table, group_base);
