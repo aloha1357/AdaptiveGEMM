@@ -118,7 +118,17 @@ __global__ void scheme_ii_grouped_mma_kernel(
         return col ^ (((row & 3) ^ ((row >> 4) & 3)) << 4);
     };
 
-    int residues[PartialCRT ? GroupSize : 1][PartialCRT ? (BM / 64) : 1][PartialCRT ? (BN / 16) : 1][PartialCRT ? 4 : 1];
+    uint32_t partial_x[PartialCRT ? (BM / 64) : 1][PartialCRT ? (BN / 16) : 1][PartialCRT ? 4 : 1];
+    uint32_t partial_M = 1;
+    if constexpr (PartialCRT) {
+        #pragma unroll
+        for (int i = 0; i < BM / 64; ++i)
+            #pragma unroll
+            for (int j = 0; j < BN / 16; ++j)
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    partial_x[i][j][t] = 0;
+    }
 
     for (int g = 0; g < n_group; ++g) {
         const int8_t* A_g = A + (size_t)g * m * k;
@@ -253,13 +263,35 @@ __global__ void scheme_ii_grouped_mma_kernel(
         int pmod = primes[group_base + g];
 
         if constexpr (PartialCRT) {
+            int inv_M = 1;
+            if (g > 0) {
+                #pragma unroll
+                for (int prev = 0; prev < GroupSize; ++prev) {
+                    if (prev < g) {
+                        inv_M = (int)(((long long)inv_M *
+                            inv_table[(group_base + prev) * 20 + (group_base + g)]) % pmod);
+                    }
+                }
+            }
             #pragma unroll
             for (int i = 0; i < BM / 64; ++i)
                 #pragma unroll
                 for (int j = 0; j < BN / 16; ++j)
                     #pragma unroll
-                    for (int t = 0; t < 4; ++t)
-                        residues[g][i][j][t] = scheme_ii_reduce_mod(acc[i][j][t], pmod);
+                    for (int t = 0; t < 4; ++t) {
+                        int r_mod = scheme_ii_reduce_mod(acc[i][j][t], pmod);
+                        if (g == 0) {
+                            partial_x[i][j][t] = (uint32_t)r_mod;
+                        } else {
+                            int x_mod = (int)(partial_x[i][j][t] % (uint32_t)pmod);
+                            int diff = r_mod - x_mod;
+                            diff %= pmod;
+                            if (diff < 0) diff += pmod;
+                            uint32_t digit = (uint32_t)(((long long)diff * inv_M) % pmod);
+                            partial_x[i][j][t] += (uint32_t)((uint64_t)digit * partial_M);
+                        }
+                    }
+            partial_M *= (uint32_t)pmod;
         } else {
             int32_t* C_g = C + (size_t)g * m * n;
             #pragma unroll
@@ -298,15 +330,8 @@ __global__ void scheme_ii_grouped_mma_kernel(
                         #pragma unroll
                         for (int c = 0; c < 2; ++c) {
                             if (gn + c >= n) break;
-                            int v[GroupSize];
-                            #pragma unroll
-                            for (int g = 0; g < GroupSize; ++g) {
-                                v[g] = (g < n_group) ? residues[g][i][j][r * 2 + c] : 0;
-                            }
-                            scheme_ii_garner_inplace(v, primes, n_group, inv_table, group_base);
-                            uint64_t X = scheme_ii_mixradix_u64(v, primes, n_group, group_base);
                             uint32_t* C_u32 = reinterpret_cast<uint32_t*>(C);
-                            C_u32[(size_t)gm * n + gn + c] = (uint32_t)X;
+                            C_u32[(size_t)gm * n + gn + c] = partial_x[i][j][r * 2 + c];
                         }
                     }
                 }
@@ -315,7 +340,8 @@ __global__ void scheme_ii_grouped_mma_kernel(
     }
 }
 
-// Small-tile true fused kernel: 64x16 output tile, 4 values/thread, all moduli, write double C.
+// Small-tile true fused kernel: 64x16 output tile, 4 values/thread, all moduli,
+// write double C. NCU shows this path is FP64/ALU epilogue bound, not HBM bound.
 __global__ void scheme_ii_true_fused_kernel(
     const int8_t* __restrict__ A_mods,
     const int8_t* __restrict__ B_mods,
