@@ -226,8 +226,6 @@ static int modInverse(int a, int m) {
 
 void execute_scheme_ii_gpu(cublasHandle_t handle, const double* d_A, const double* d_B, double* d_C, 
                            int m, int n, int k, int num_moduli) {
-    std::cout << "[Scheme II GPU] executing with num_moduli = " << num_moduli << std::endl;
-
     int m_pad = ((m + 127) / 128) * 128;
     int n_pad = ((n + 127) / 128) * 128;
     int k_pad = ((k + 31) / 32) * 32;

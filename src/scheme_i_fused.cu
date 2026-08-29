@@ -20,6 +20,81 @@ void scheme_i_pack(const double* d_A, const double* d_B, double* d_C,
                    int8_t* A_slices, int8_t* B_slices, double* maxA, double* maxB,
                    int32_t* eA, int32_t* eB, int32_t* row_sum, int32_t* col_sum);
 
+__global__ void fused_scale_split_A(
+    const double* A, int8_t* slices, int32_t* eA, int32_t* row_sum,
+    int m, int k, int p, int mantissa_bits, int bits_per_int8
+) {
+    int warp_id = threadIdx.y;
+    int lane_id = threadIdx.x;
+    int row = blockIdx.x * blockDim.y + warp_id;
+
+    if (row >= m) return;
+
+    double max_val = 0.0;
+    for (int col = lane_id; col < k; col += 32) {
+        double v = fabs(A[(size_t)row * k + col]);
+        if (v > max_val) max_val = v;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        double other = __shfl_down_sync(0xffffffff, max_val, offset);
+        if (other > max_val) max_val = other;
+    }
+
+    int e = 0;
+    if (max_val != 0.0) e = (int)ceil(log2(max_val));
+
+    e = __shfl_sync(0xffffffff, e, 0);
+
+    if (lane_id == 0) {
+        eA[row] = e;
+    }
+
+    int32_t sum[10];
+    for (int a = 0; a < p; ++a) sum[a] = 0;
+
+    for (int col = lane_id; col < k; col += 32) {
+        double x = A[(size_t)row * k + col];
+        double scaled = ldexp(x, -e);
+        double q_double = round(scaled * ldexp(1.0, mantissa_bits));
+        long long q = (long long)q_double;
+
+        for (int a = 0; a < p; ++a) {
+            int8_t S;
+            if (a == 0) {
+                S = (int8_t)(q >> (bits_per_int8 * (p - 1)));
+            } else {
+                int mask = (1 << bits_per_int8) - 1;
+                int bias = 1 << (bits_per_int8 - 1);
+                int u = (q >> (bits_per_int8 * (p - 1 - a))) & mask;
+                S = (int8_t)(u - bias);
+            }
+            slices[(size_t)a * m * k + (size_t)row * k + col] = S;
+            sum[a] += S;
+        }
+    }
+
+    for (int a = 0; a < p; ++a) {
+        int32_t s = sum[a];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            s += __shfl_down_sync(0xffffffff, s, offset);
+        }
+        if (lane_id == 0) {
+            row_sum[a * m + row] = s;
+        }
+    }
+}
+
+void launch_fused_scale_split_A(const double* A, int8_t* slices, int32_t* eA, int32_t* row_sum,
+                                int m, int k, int p, int mantissa_bits, int bits_per_int8, cudaStream_t stream) {
+    dim3 block(32, 4); // 4 warps per block
+    dim3 grid((m + block.y - 1) / block.y);
+    fused_scale_split_A<<<grid, block, 0, stream>>>(A, slices, eA, row_sum, m, k, p, mantissa_bits, bits_per_int8);
+    CHECK_CUDA(cudaGetLastError());
+}
+
 __global__ void fused_scheme_i_kernel(
     const double* __restrict__ d_C_in, double* __restrict__ d_C,
     const int8_t* __restrict__ A_slices, const int8_t* __restrict__ B_slices,
@@ -165,8 +240,6 @@ void execute_scheme_i_fused(const double* d_A, const double* d_B, double* d_C,
         execute_scheme_i_b1(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, triangular, T, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum, C_i32);
         return;
     }
-
-    scheme_i_pack(d_A, d_B, d_C, m, n, k, mantissa_bits, p, bits_per_int8, A_slices, B_slices, maxA, maxB, eA, eB, row_sum, col_sum);
 
     const int BM = 128;
     const int BN = 64;

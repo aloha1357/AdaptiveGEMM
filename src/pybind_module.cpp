@@ -55,7 +55,9 @@ static ExecutionMode parse_mode(const std::string& mode) {
     if (mode == "phase25" || mode == "Phase25Stacking") return ExecutionMode::Phase25Stacking;
     if (mode == "phase26" || mode == "Phase26HybridOzaki") return ExecutionMode::Phase26HybridOzaki;
     if (mode == "scheme_i" || mode == "SchemeI") return ExecutionMode::SchemeI;
-    throw std::runtime_error("Unknown mode '" + mode + "'. Use phase22 (default).");
+    if (mode == "scheme_ii" || mode == "SchemeII") return ExecutionMode::SchemeII;
+    if (mode == "scheme_ii_fused" || mode == "SchemeII_Fused") return ExecutionMode::SchemeII_Fused;
+    throw std::runtime_error("Unknown mode '" + mode + "'. Use phase22, scheme_i, or scheme_ii.");
 }
 
 class AdaptiveGEMMWrapper {

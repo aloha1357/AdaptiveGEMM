@@ -424,3 +424,92 @@ void int8_gemm_s8s8s32_f64_epilogue(
     }
 }
 } // namespace ozaki
+// ---------------------------------------------------------------------------
+// Phase 22 Fused: Garner CRT Epilogue
+// ---------------------------------------------------------------------------
+namespace ozaki {
+
+__device__ inline int device_mod_inv(int a, int m) {
+    int m0 = m, y = 0, x = 1;
+    if (m == 1) return 0;
+    while (a > 1) {
+        int q = a / m;
+        int t = m;
+        m = a % m, a = t;
+        t = y;
+        y = x - q * y;
+        x = t;
+    }
+    if (x < 0) x += m0;
+    return x;
+}
+
+__device__ inline double garner_reconstruct(
+    const int32_t* r, const int* p, int n
+) {
+    int a[20];
+    for (int i = 0; i < n; ++i) a[i] = r[i];
+
+    for (int i = 1; i < n; ++i) {
+        for (int j = 0; j < i; ++j) {
+            int diff = ((a[i] - a[j]) % p[i] + p[i]) % p[i];
+            a[i] = (int)((long long)diff * device_mod_inv(p[j], p[i]) % p[i]);
+        }
+    }
+
+    double result = (double)a[n - 1];
+    for (int i = n - 2; i >= 0; --i)
+        result = result * (double)p[i] + (double)a[i];
+
+    return result;
+}
+
+__global__ void garner_crt_kernel(
+    const int32_t* __restrict__ C_mods,
+    double* __restrict__ C_out,
+    const int* primes, int num_moduli,
+    double M_half,
+    double scale_inv_sq,
+    int mn
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= mn) return;
+
+    int32_t r[20];
+    for (int i = 0; i < num_moduli; ++i)
+        r[i] = C_mods[(size_t)i * mn + idx];
+
+    double val = garner_reconstruct(r, primes, num_moduli);
+    if (val > M_half) val -= 2.0 * M_half;
+    C_out[idx] += val * scale_inv_sq;
+}
+
+void int8_gemm_run_crt_phase22_fused(
+    const int8_t* A_mods, const int8_t* B_mods, int32_t* C_mods, double* C_out,
+    int m, int n, int k, int m_pad, int n_pad, int k_pad,
+    const int* primes, int num_moduli,
+    double M_half, double scale_inv_sq,
+    cudaStream_t stream) 
+{
+    size_t padded_mk = (size_t)((m + 127) / 128) * ((k + 31) / 32) * 4096;
+    size_t padded_kn = (size_t)((n + 63) / 64) * ((k + 31) / 32) * 2048;
+    size_t mn_pad = (size_t)m_pad * n_pad;
+
+    for (int i = 0; i < num_moduli; ++i) {
+        const int8_t* A_i = A_mods + i * padded_mk;
+        const int8_t* B_i = B_mods + i * padded_kn;
+        int32_t* C_i = C_mods + i * mn_pad;
+        
+        int8_gemm_s8s8s32(A_i, B_i, C_i, m_pad, n_pad, k_pad, stream);
+    }
+    
+    size_t mn = (size_t)m_pad * n_pad;
+    int threads = 256;
+    int blocks = (mn + threads - 1) / threads;
+    
+    garner_crt_kernel<<<blocks, threads, 0, stream>>>(
+        C_mods, C_out, primes, num_moduli, M_half, scale_inv_sq, (int)mn
+    );
+}
+
+} // namespace ozaki

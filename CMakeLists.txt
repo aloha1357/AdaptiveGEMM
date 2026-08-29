@@ -53,7 +53,14 @@ function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
             ${CU_FILE}
             -o
             ${OBJ_FILE}
-        DEPENDS "${CU_FILE}" "${ADAPTIVEGEMM_ROOT}/include/AdaptiveOzaki.h" "${ADAPTIVEGEMM_ROOT}/include/scheme_i.h"
+        DEPENDS
+            "${CU_FILE}"
+            "${ADAPTIVEGEMM_ROOT}/include/AdaptiveOzaki.h"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_i.h"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_fused.h"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_gpu.h"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_moduli.h"
+            "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_int192.h"
         COMMENT "Compiling ${CU_FILE} with nvcc"
         VERBATIM
     )
@@ -78,12 +85,17 @@ set(SCHEME_II_GPU_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_ii_gpu.cu")
 set(SCHEME_II_GPU_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_ii_gpu.cu.obj")
 adaptive_nvcc_cu_obj("${SCHEME_II_GPU_CU}" "${SCHEME_II_GPU_OBJ}")
 
+set(SCHEME_II_FUSED_CU "${ADAPTIVEGEMM_ROOT}/src/scheme_ii_fused.cu")
+set(SCHEME_II_FUSED_OBJ "${CMAKE_CURRENT_BINARY_DIR}/scheme_ii_fused.cu.obj")
+adaptive_nvcc_cu_obj("${SCHEME_II_FUSED_CU}" "${SCHEME_II_FUSED_OBJ}")
+
 add_library(adaptive_gemm STATIC
     "${ADAPTIVEGEMM_OBJ}"
     "${INT8GEMM_OBJ}"
     "${SCHEME_I_OBJ}"
     "${SCHEME_I_FUSED_OBJ}"
     "${SCHEME_II_GPU_OBJ}"
+    "${SCHEME_II_FUSED_OBJ}"
     "${ADAPTIVEGEMM_ROOT}/src/bench_int8.cpp"
     "${ADAPTIVEGEMM_ROOT}/src/scheme_ii_plan.cpp"
 )
@@ -105,28 +117,31 @@ target_link_libraries(adaptive_gemm
 )
 
 # Optional Python binding via pybind11
-include(FetchContent)
-FetchContent_Declare(
-    pybind11
-    GIT_REPOSITORY https://github.com/pybind/pybind11.git    
-    GIT_TAG        v2.11.1
-)
-FetchContent_MakeAvailable(pybind11)
+option(ADAPTIVEGEMM_BUILD_PYTHON "Build Python bindings" OFF)
+if(ADAPTIVEGEMM_BUILD_PYTHON)
+    include(FetchContent)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG        v2.11.1
+    )
+    FetchContent_MakeAvailable(pybind11)
 
-find_package(Python COMPONENTS Interpreter Development REQUIRED)
+    find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
-pybind11_add_module(adaptive_gemm_py
-        src/pybind_module.cpp
-)
+    pybind11_add_module(adaptive_gemm_py
+            src/pybind_module.cpp
+    )
 
-target_include_directories(adaptive_gemm_py PUBLIC ${ADAPTIVEGEMM_ROOT}/include)
+    target_include_directories(adaptive_gemm_py PUBLIC ${ADAPTIVEGEMM_ROOT}/include)
 
-target_link_libraries(adaptive_gemm_py PRIVATE 
-    pybind11::module
-    adaptive_gemm
-    CUDA::cublas
-    CUDA::cudart
-)
+    target_link_libraries(adaptive_gemm_py PRIVATE
+        pybind11::module
+        adaptive_gemm
+        CUDA::cublas
+        CUDA::cudart
+    )
+endif()
 
 add_executable(adaptive_gemm_demo
     examples/demo_main.cpp
@@ -193,12 +208,15 @@ target_link_libraries(adaptive_gemm_scheme_i_test
 
 add_test(NAME scheme_i COMMAND adaptive_gemm_scheme_i_test)
 
-# Add pytest for the Python binding
-add_test(NAME pytest_binding
-    COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py
-)
+add_executable(adaptive_gemm_scheme_ii_fused_compare_test tests/scheme_ii_fused_compare_test.cpp)
+target_link_libraries(adaptive_gemm_scheme_ii_fused_compare_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
+add_test(NAME scheme_ii_fused COMMAND adaptive_gemm_scheme_ii_fused_compare_test)
 
-# Ensure Python can find the built module by setting PYTHONPATH to the library output directory
-set_tests_properties(pytest_binding PROPERTIES
-    ENVIRONMENT "PYTHONPATH=$<TARGET_FILE_DIR:adaptive_gemm_py>"
-)
+if(ADAPTIVEGEMM_BUILD_PYTHON)
+    add_test(NAME pytest_binding
+        COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py
+    )
+    set_tests_properties(pytest_binding PROPERTIES
+        ENVIRONMENT "PYTHONPATH=$<TARGET_FILE_DIR:adaptive_gemm_py>"
+    )
+endif()

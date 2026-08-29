@@ -22,7 +22,7 @@ cudaError_t int8_gemm_s8s8s32_launch(const int8_t* A, const int8_t* B, int32_t* 
                                       int m, int n, int k, cudaStream_t stream);
 
 // Non-template convenience entry point (calls <128,128,64,3> specialization).
-// Declared here, defined in int8_gemm.cu — avoids specialization ordering issue.
+// Declared here, defined in int8_gemm.cu ??avoids specialization ordering issue.
 cudaError_t int8_gemm_s8s8s32(const int8_t* A, const int8_t* B, int32_t* C,
                                int m, int n, int k, cudaStream_t stream);
 
@@ -57,5 +57,13 @@ struct Int8GemmBench {
 // Uses the same row-major trick as the cuBLAS reference:
 //   C = A*B (row-major) == cublasGemmEx(N,N, n,n,n, B,A,C, R_8I, COMPUTE_32I)
 Int8GemmBench bench_int8_gemm_vs_cublas(int m, int n, int k);
+
+
+void int8_gemm_run_crt_phase22_fused(
+    const int8_t* A_mods, const int8_t* B_mods, int32_t* C_mods, double* C_out,
+    int m, int n, int k, int m_pad, int n_pad, int k_pad,
+    const int* primes, int num_moduli,
+    double M_half, double scale_inv_sq,
+    cudaStream_t stream);
 
 } // namespace ozaki

@@ -1,3 +1,4 @@
+﻿#include "scheme_ii_int192.h"
 #pragma once
 
 #include <cuda_runtime.h>
@@ -17,12 +18,14 @@ struct PreScanStats {
 
 enum class ExecutionMode {
     Phase22,
+    Phase22_Fused,
     Phase23Hetero,
     Phase24ExtremeMix,
     Phase25Stacking,
     Phase26HybridOzaki,
     SchemeI,
-    SchemeII
+    SchemeII,
+    SchemeII_Fused
 };
 
 enum class PrecisionPolicy {
@@ -51,10 +54,15 @@ struct PrecisionContract {
     int bits_per_int8 = 0;
     int num_moduli = 0;
     bool residual_enabled = false;
+    bool residual_used = false;
     bool native_fp64_used = false;
+    std::string fallback_mode = "";
     std::string failure_reason = "";
     double max_relative_error = -1.0;
     bool passed_precision_gate = false;
+    bool used_cuda_graph = false;
+    bool used_true_fused_kernel = false;
+    bool used_scheme_ii_fused = false;
     std::vector<PipelineStage> stages;
 };
 
@@ -85,6 +93,11 @@ struct OzakiConfig {
     int scheme_ii_num_split = 0;
     int scheme_ii_bits_per_int8 = 0;
     bool scheme_ii_fastmode = true;
+    bool scheme_ii_reuse_workspace = true;
+    bool scheme_ii_use_batched_gemm = true;
+    bool scheme_ii_use_cuda_graph = false;
+    bool scheme_ii_use_true_fused_kernel = false;
+    int scheme_ii_moduli_group_size = 4;
     bool enable_stage_profiling = false;
 
     // Legacy fields (kept for backward compatibility, specifically Phase22)
@@ -108,8 +121,9 @@ struct OzakiConfig {
     double tile_error_guard = 1e-9;
     int scheme_i_mantissa_bits = 34;
     bool scheme_i_triangular = true;
-    bool scheme_i_use_cublas_int8 = false;
+    bool scheme_i_use_cublas_int8 = true;
     bool scheme_i_fused = false;
+    bool enable_skip_scalA = false;
 };
 
 class AdaptiveOzakiEngine {
@@ -127,6 +141,7 @@ public:
 
     const SchemePlan& getSchemePlan() const { return current_plan_; }
     const PrecisionContract& getPrecisionContract() const { return current_contract_; }
+    PrecisionContract& mutablePrecisionContract() { return current_contract_; }
 
     static void bitShiftToINT8(const double* d_src, int8_t* d_dst_int8, int elem_count, int exponent_shift);
     static void computeResidualGradedRing(const double* d_A, const double* d_B, const double* d_C, double* d_R, int m, int n, int k);
@@ -143,6 +158,7 @@ private:
     OzakiConfig config_;
     SchemePlan current_plan_;
     PrecisionContract current_contract_;
+    bool scalA_cached_ = false;
     double ratio_fp64_tc = -1.0; // -1 means not profiled yet
     double ratio_fp32_tc = -1.0;
     double ratio_fp16_tc = -1.0;
@@ -171,9 +187,33 @@ private:
     int32_t* d_col_sum = nullptr;
     int32_t* d_C_i32 = nullptr;
     
+public:
+    // Scheme II workspace
+    int* d_scheme_ii_eA = nullptr;
+    int* d_scheme_ii_eB = nullptr;
+    int8_t* d_scheme_ii_A_mod = nullptr;
+    int8_t* d_scheme_ii_B_mod = nullptr;
+    int32_t* d_scheme_ii_C_mod = nullptr;
+    int32_t* d_scheme_ii_primes = nullptr;
+    int32_t* d_scheme_ii_inv_table = nullptr;
+    Int192* d_scheme_ii_P = nullptr;
+    int d_scheme_ii_ws_num_moduli = 0;
+    cudaStream_t d_scheme_ii_stream = nullptr;
+    cudaGraph_t d_scheme_ii_graph = nullptr;
+    cudaGraphExec_t d_scheme_ii_graph_exec = nullptr;
+    bool d_scheme_ii_graph_valid = false;
+    int d_scheme_ii_graph_m = 0;
+    int d_scheme_ii_graph_n = 0;
+    int d_scheme_ii_graph_k = 0;
+    int d_scheme_ii_graph_num_moduli = 0;
+    const double* d_scheme_ii_graph_A = nullptr;
+    const double* d_scheme_ii_graph_B = nullptr;
+    double* d_scheme_ii_graph_C = nullptr;
+private:
     int ws_m_ = 0, ws_n_ = 0, ws_k_ = 0;
     ExecutionMode ws_mode_ = ExecutionMode::Phase22;
     bool workspace_allocated_ = false;
     cublasHandle_t cublas_handle_;
 };
 } 
+

@@ -1,4 +1,5 @@
 #include "int8_gemm.h"
+#include <cuComplex.h>
 #include "scheme_i.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
