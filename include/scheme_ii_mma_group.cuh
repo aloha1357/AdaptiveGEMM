@@ -162,17 +162,9 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
         return col ^ (((row & 3) ^ ((row >> 4) & 3)) << 4);
     };
 
-    [[maybe_unused]] uint32_t partial_x[PartialCRT ? (BM / 64) : 1][PartialCRT ? (BN / 16) : 1][PartialCRT ? 4 : 1];
+    // Online CRT partials live in the output uint32 plane, not in registers,
+    // so the MMA K-loop is not occupancy-1 from a 64-value partial_x array.
     [[maybe_unused]] uint32_t partial_M = 1;
-    if constexpr (PartialCRT) {
-        #pragma unroll
-        for (int i = 0; i < BM / 64; ++i)
-            #pragma unroll
-            for (int j = 0; j < BN / 16; ++j)
-                #pragma unroll
-                for (int t = 0; t < 4; ++t)
-                    partial_x[i][j][t] = 0;
-    }
 
     for (int g = 0; g < n_group; ++g) {
         const int8_t* A_g = A + (size_t)g * m * k;
@@ -195,9 +187,7 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
                 int col = (i * 16) % BK;
                 int gm = bm_off + row;
                 int gk = k_offset + col;
-                if (gm < m && gk < k) {
-                    cp_async_16(&sA[row * 128 + swizzle_A(row, col)], &A_g[(size_t)gm * k + gk]);
-                }
+                cp_async_16(&sA[row * 128 + swizzle_A(row, col)], &A_g[(size_t)gm * k + gk]);
             }
         };
         auto load_b_smem = [&](int buf, int k_offset) {
@@ -207,13 +197,11 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
                 int col = (i * 16) % BN;
                 int gk = k_offset + row;
                 int gn = bn_off + col;
-                if (gk < k && gn < n) {
-                    int4 v = *(int4*)&B_g[(size_t)gk * n + gn];
-                    int8_t* bytes = (int8_t*)&v;
-                    #pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        sB[(col + j) * 64 + swizzle_B(col + j, row)] = bytes[j];
-                    }
+                int4 v = *(int4*)&B_g[(size_t)gk * n + gn];
+                int8_t* bytes = (int8_t*)&v;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    sB[(col + j) * 64 + swizzle_B(col + j, row)] = bytes[j];
                 }
             }
         };
@@ -308,24 +296,46 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
             if (g > 0) {
                 inv_M = scheme_ii_modinv((int)(partial_M % (uint32_t)pmod), pmod);
             }
+            const int r_off[2] = { lane / 4, lane / 4 + 8 };
+            const int c_off = (lane % 4) * 2;
+            uint32_t* C_u32 = reinterpret_cast<uint32_t*>(C);
             #pragma unroll
-            for (int i = 0; i < BM / 64; ++i)
+            for (int i = 0; i < BM / 64; ++i) {
                 #pragma unroll
-                for (int j = 0; j < BN / 16; ++j)
+                for (int j = 0; j < BN / 16; ++j) {
                     #pragma unroll
-                    for (int t = 0; t < 4; ++t) {
-                        int r_mod = scheme_ii_reduce_mod(acc[i][j][t], pmod);
-                        if (g == 0) {
-                            partial_x[i][j][t] = (uint32_t)r_mod;
-                        } else {
-                            int x_mod = (int)(partial_x[i][j][t] % (uint32_t)pmod);
-                            int diff = r_mod - x_mod;
-                            diff %= pmod;
-                            if (diff < 0) diff += pmod;
-                            uint32_t digit = (uint32_t)(((long long)diff * inv_M) % pmod);
-                            partial_x[i][j][t] += (uint32_t)((uint64_t)digit * partial_M);
+                    for (int r = 0; r < 2; ++r) {
+                        int gm = bm_off + wm * (BM / 4) + i * 16 + r_off[r];
+                        int gn = bn_off + wn * (BN / 2) + j * 8 + c_off;
+                        uint2 prev = {0, 0};
+                        if (g > 0 && gm < m && gn < n) {
+                            prev = *reinterpret_cast<uint2*>(&C_u32[(size_t)gm * n + gn]);
+                        }
+                        uint32_t outv[2];
+                        #pragma unroll
+                        for (int c = 0; c < 2; ++c) {
+                            int r_mod = scheme_ii_reduce_mod(acc[i][j][r * 2 + c], pmod);
+                            if (g == 0) {
+                                outv[c] = (uint32_t)r_mod;
+                            } else {
+                                uint32_t px = (&prev.x)[c];
+                                int x_mod = (int)(px % (uint32_t)pmod);
+                                int diff = r_mod - x_mod;
+                                diff %= pmod;
+                                if (diff < 0) diff += pmod;
+                                uint32_t digit = (uint32_t)(((long long)diff * inv_M) % pmod);
+                                outv[c] = px + (uint32_t)((uint64_t)digit * partial_M);
+                            }
+                        }
+                        if (gm < m && gn < n) {
+                            uint2 st;
+                            st.x = outv[0];
+                            st.y = outv[1];
+                            *reinterpret_cast<uint2*>(&C_u32[(size_t)gm * n + gn]) = st;
                         }
                     }
+                }
+            }
             partial_M *= (uint32_t)pmod;
             (void)inv_table;
         } else {
@@ -351,30 +361,6 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
             }
         }
         __syncthreads();
-    }
-
-    if constexpr (PartialCRT) {
-        const int r_off[2] = { lane / 4, lane / 4 + 8 };
-        const int c_off = (lane % 4) * 2;
-        #pragma unroll
-        for (int i = 0; i < BM / 64; ++i) {
-            #pragma unroll
-            for (int j = 0; j < BN / 16; ++j) {
-                #pragma unroll
-                for (int r = 0; r < 2; ++r) {
-                    int gm = bm_off + wm * (BM / 4) + i * 16 + r_off[r];
-                    int gn = bn_off + wn * (BN / 2) + j * 8 + c_off;
-                    if (gm < m && gn < n) {
-                        #pragma unroll
-                        for (int c = 0; c < 2; ++c) {
-                            if (gn + c >= n) break;
-                            uint32_t* C_u32 = reinterpret_cast<uint32_t*>(C);
-                            C_u32[(size_t)gm * n + gn + c] = partial_x[i][j][r * 2 + c];
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -868,6 +854,9 @@ inline cudaError_t scheme_ii_launch_grouped_mma_inst(
     dim3 block(256);
     dim3 grid(n / BN, m / BM);
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if constexpr (MinBlocks >= 2) {
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    }
     fn<<<grid, block, smem_size, stream>>>(
         A, B, C, m, n, k, n_group, primes, inv_table, group_base);
     return cudaGetLastError();
@@ -905,7 +894,7 @@ inline cudaError_t scheme_ii_launch_grouped_mma(
             if (bm == 128 && bn == 128 && stages == 2 && swizzle == 2)
                 return scheme_ii_launch_grouped_mma_inst<4, true, 2, 128, 128, 2, 1>(
                     A, B, C, m, n, k, n_group, primes, inv_table, group_base, stream);
-            return scheme_ii_launch_grouped_mma_inst<4, true, 2, 128, 128, 0, 1>(
+            return scheme_ii_launch_grouped_mma_inst<4, true, 2, 128, 128, 0, 2>(
                 A, B, C, m, n, k, n_group, primes, inv_table, group_base, stream);
         }
         if (bm == 128 && bn == 64 && stages == 2 && swizzle == 1)
