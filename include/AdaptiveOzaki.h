@@ -217,6 +217,8 @@ public:
     Int192* d_scheme_ii_P = nullptr;
     int d_scheme_ii_ws_num_moduli = 0;
     cudaStream_t d_scheme_ii_stream = nullptr;
+    cudaStream_t d_scheme_ii_stream2 = nullptr;
+    cudaEvent_t d_scheme_ii_ev_b = nullptr;
     cudaGraph_t d_scheme_ii_graph = nullptr;
     cudaGraphExec_t d_scheme_ii_graph_exec = nullptr;
     bool d_scheme_ii_graph_valid = false;

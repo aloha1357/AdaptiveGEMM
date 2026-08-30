@@ -272,6 +272,14 @@ void AdaptiveOzakiEngine::freeWorkspace() {
         cudaStreamDestroy(d_scheme_ii_stream);
         d_scheme_ii_stream = nullptr;
     }
+    if (d_scheme_ii_stream2) {
+        cudaStreamDestroy(d_scheme_ii_stream2);
+        d_scheme_ii_stream2 = nullptr;
+    }
+    if (d_scheme_ii_ev_b) {
+        cudaEventDestroy(d_scheme_ii_ev_b);
+        d_scheme_ii_ev_b = nullptr;
+    }
     d_scheme_ii_ws_num_moduli = 0;
     
     cudaFree(dmA_h); dmA_h = nullptr; cudaFree(dmA_l); dmA_l = nullptr;

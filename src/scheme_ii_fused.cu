@@ -61,32 +61,41 @@ __device__ __forceinline__ double fused_pow2i_fast(int e) {
     return ldexp(1.0, e);
 }
 
-static __global__ void fused_compute_exp_A_kernel(const double* A, int* eA, int m, int k) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m) {
-        double max_val = 0.0;
-        for (int kk = 0; kk < k; ++kk) {
-            double v = fabs(A[(size_t)i * k + kk]);
-            if (v > max_val) max_val = v;
-        }
-        int exp = 0;
-        if (max_val > 0.0) frexp(max_val, &exp);
-        eA[i] = exp;
-    }
+static __device__ __forceinline__ int8_t fused_residue_i8(int64_t v_int, int p) {
+    int rem = (int)(v_int % p);
+    if (rem < 0) rem += p;
+    if (rem > p / 2) rem -= p;
+    return (int8_t)rem;
 }
 
-static __global__ void fused_compute_exp_B_kernel(const double* B, int* eB, int k, int n) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < n) {
-        double max_val = 0.0;
-        for (int kk = 0; kk < k; ++kk) {
-            double v = fabs(B[(size_t)kk * n + j]);
-            if (v > max_val) max_val = v;
-        }
-        int exp = 0;
-        if (max_val > 0.0) frexp(max_val, &exp);
-        eB[j] = exp;
+static __global__ void fused_compute_exp_A_kernel(const double* __restrict__ A, int* __restrict__ eA, int m, int k) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m) return;
+    const double* row = A + (size_t)i * k;
+    double max_val = 0.0;
+    int kk = 0;
+    for (; kk + 3 < k; kk += 4) {
+        max_val = fmax(max_val, fabs(row[kk]));
+        max_val = fmax(max_val, fabs(row[kk + 1]));
+        max_val = fmax(max_val, fabs(row[kk + 2]));
+        max_val = fmax(max_val, fabs(row[kk + 3]));
     }
+    for (; kk < k; ++kk) max_val = fmax(max_val, fabs(row[kk]));
+    int exp = 0;
+    if (max_val > 0.0) frexp(max_val, &exp);
+    eA[i] = exp;
+}
+
+static __global__ void fused_compute_exp_B_kernel(const double* __restrict__ B, int* __restrict__ eB, int k, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    double max_val = 0.0;
+    for (int kk = 0; kk < k; ++kk) {
+        max_val = fmax(max_val, fabs(B[(size_t)kk * n + j]));
+    }
+    int exp = 0;
+    if (max_val > 0.0) frexp(max_val, &exp);
+    eB[j] = exp;
 }
 
 static __global__ void fused_quantize_A_kernel(const double* __restrict__ A, int8_t* __restrict__ A_mod,
@@ -94,23 +103,30 @@ static __global__ void fused_quantize_A_kernel(const double* __restrict__ A, int
                                               int m, int k, int m_pad, int k_pad, int num_moduli,
                                               const int32_t* __restrict__ primes, int S) {
     int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int kk = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m && kk < k) {
-        double val = A[(size_t)i * k + kk];
-        int exp = eA[i];
-        double scaled = val * ldexp(1.0, S - exp);
-        int64_t v_int = llround(scaled);
-        for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-            int p = primes[p_idx];
-            int rem = (int)(v_int % p);
-            if (rem < 0) rem += p;
-            if (rem > p / 2) rem -= p;
-            A_mod[(size_t)p_idx * m_pad * k_pad + i * k_pad + kk] = (int8_t)rem;
+    int kk = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= m_pad || kk >= k_pad) return;
+
+    int64_t v_int[4] = {0, 0, 0, 0};
+    if (i < m) {
+        double scale = fused_pow2i_fast(S - eA[i]);
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            int col = kk + t;
+            if (col < k) v_int[t] = llround(A[(size_t)i * k + col] * scale);
         }
-    } else if (i < m_pad && kk < k_pad) {
-        for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-            A_mod[(size_t)p_idx * m_pad * k_pad + i * k_pad + kk] = 0;
-        }
+    }
+
+    int p_reg[20];
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) p_reg[p_idx] = primes[p_idx];
+
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        int p = p_reg[p_idx];
+        char4 out;
+        out.x = fused_residue_i8(v_int[0], p);
+        out.y = fused_residue_i8(v_int[1], p);
+        out.z = fused_residue_i8(v_int[2], p);
+        out.w = fused_residue_i8(v_int[3], p);
+        *reinterpret_cast<char4*>(&A_mod[(size_t)p_idx * m_pad * k_pad + i * k_pad + kk]) = out;
     }
 }
 
@@ -118,24 +134,32 @@ static __global__ void fused_quantize_B_kernel(const double* __restrict__ B, int
                                               const int* __restrict__ eB,
                                               int k, int n, int k_pad, int n_pad, int num_moduli,
                                               const int32_t* __restrict__ primes, int S) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     int kk = blockIdx.y * blockDim.y + threadIdx.y;
-    if (kk < k && j < n) {
-        double val = B[(size_t)kk * n + j];
-        int exp = eB[j];
-        double scaled = val * ldexp(1.0, S - exp);
-        int64_t v_int = llround(scaled);
-        for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-            int p = primes[p_idx];
-            int rem = (int)(v_int % p);
-            if (rem < 0) rem += p;
-            if (rem > p / 2) rem -= p;
-            B_mod[(size_t)p_idx * k_pad * n_pad + kk * n_pad + j] = (int8_t)rem;
+    if (kk >= k_pad || j >= n_pad) return;
+
+    int64_t v_int[4] = {0, 0, 0, 0};
+    if (kk < k) {
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            int col = j + t;
+            if (col < n) {
+                v_int[t] = llround(B[(size_t)kk * n + col] * fused_pow2i_fast(S - eB[col]));
+            }
         }
-    } else if (kk < k_pad && j < n_pad) {
-        for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-            B_mod[(size_t)p_idx * k_pad * n_pad + kk * n_pad + j] = 0;
-        }
+    }
+
+    int p_reg[20];
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) p_reg[p_idx] = primes[p_idx];
+
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        int p = p_reg[p_idx];
+        char4 out;
+        out.x = fused_residue_i8(v_int[0], p);
+        out.y = fused_residue_i8(v_int[1], p);
+        out.z = fused_residue_i8(v_int[2], p);
+        out.w = fused_residue_i8(v_int[3], p);
+        *reinterpret_cast<char4*>(&B_mod[(size_t)p_idx * k_pad * n_pad + kk * n_pad + j]) = out;
     }
 }
 
@@ -309,28 +333,38 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
                                   cudaEvent_t* ev, bool profile, bool use_custom_mma,
                                   int group_size, bool use_partial_crt, bool use_true_fused,
                                   const int32_t* h_primes, int* gemm_launches_out,
-                                  int mma_variant, bool use_prologue_fusion) {
-    const int block_size = 256;
+                                  int mma_variant, bool use_prologue_fusion,
+                                  cudaStream_t stream2, cudaEvent_t ev_b) {
+    dim3 block2d(16, 16);
+    cudaStream_t streamB = (stream2 && stream2 != stream) ? stream2 : stream;
     if (profile) cudaEventRecord(ev[0], stream);
-    fused_compute_exp_A_kernel<<<(m + block_size - 1) / block_size, block_size, 0, stream>>>(d_A, d_eA, m, k);
+
+    fused_compute_exp_A_kernel<<<(m + 255) / 256, 256, 0, stream>>>(d_A, d_eA, m, k);
     if (profile) cudaEventRecord(ev[1], stream);
 
-    fused_compute_exp_B_kernel<<<(n + block_size - 1) / block_size, block_size, 0, stream>>>(d_B, d_eB, k, n);
-    if (profile) cudaEventRecord(ev[2], stream);
+    fused_compute_exp_B_kernel<<<(n + 255) / 256, 256, 0, streamB>>>(d_B, d_eB, k, n);
+    if (profile) cudaEventRecord(ev[2], streamB);
 
-    dim3 block2d(16, 16);
     const bool skip_global_quantize = use_custom_mma && use_partial_crt && use_prologue_fusion && !use_true_fused;
     if (!skip_global_quantize) {
-        dim3 gridA((k_pad + 15) / 16, (m_pad + 15) / 16);
-        fused_quantize_A_kernel<<<gridA, block2d, 0, stream>>>(d_A, d_A_mod, d_eA, m, k, m_pad, k_pad, num_moduli, d_primes, S);
+        dim3 qblock(32, 8);
+        dim3 gridA(((k_pad / 4) + 31) / 32, (m_pad + 7) / 8);
+        fused_quantize_A_kernel<<<gridA, qblock, 0, stream>>>(d_A, d_A_mod, d_eA, m, k, m_pad, k_pad, num_moduli, d_primes, S);
         if (profile) cudaEventRecord(ev[3], stream);
 
-        dim3 gridB((n_pad + 15) / 16, (k_pad + 15) / 16);
-        fused_quantize_B_kernel<<<gridB, block2d, 0, stream>>>(d_B, d_B_mod, d_eB, k, n, k_pad, n_pad, num_moduli, d_primes, S);
-        if (profile) cudaEventRecord(ev[4], stream);
+        dim3 gridB(((n_pad / 4) + 31) / 32, (k_pad + 7) / 8);
+        fused_quantize_B_kernel<<<gridB, qblock, 0, streamB>>>(d_B, d_B_mod, d_eB, k, n, k_pad, n_pad, num_moduli, d_primes, S);
+        if (profile) cudaEventRecord(ev[4], streamB);
     } else {
         if (profile) cudaEventRecord(ev[3], stream);
-        if (profile) cudaEventRecord(ev[4], stream);
+        if (profile) cudaEventRecord(ev[4], streamB);
+    }
+
+    if (streamB != stream && ev_b) {
+        cudaEventRecord(ev_b, streamB);
+        cudaStreamWaitEvent(stream, ev_b, 0);
+    } else if (streamB != stream) {
+        cudaStreamSynchronize(streamB);
     }
 
     long long stride_B = (long long)k_pad * n_pad;
@@ -529,7 +563,14 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     if (!engine->d_scheme_ii_stream) {
         cudaStreamCreate(&engine->d_scheme_ii_stream);
     }
+    if (!engine->d_scheme_ii_stream2) {
+        cudaStreamCreate(&engine->d_scheme_ii_stream2);
+    }
+    if (!engine->d_scheme_ii_ev_b) {
+        cudaEventCreateWithFlags(&engine->d_scheme_ii_ev_b, cudaEventDisableTiming);
+    }
     cudaStream_t stream = engine->d_scheme_ii_stream;
+    cudaStream_t stream2 = engine->d_scheme_ii_stream2;
     cublasSetStream(handle, stream);
 
     const bool profile = config.enable_stage_profiling;
@@ -565,7 +606,8 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
                                       num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
                                       d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, nullptr, false,
                                       use_custom_mma, group_size, use_partial_crt, use_true_fused,
-                                      h_primes, &gemm_launches, mma_variant, use_prologue_fusion);
+                                      h_primes, &gemm_launches, mma_variant, use_prologue_fusion,
+                                      nullptr, nullptr);
                 cudaGraph_t graph = nullptr;
                 cap_st = cudaStreamEndCapture(stream, &graph);
                 if (cap_st == cudaSuccess && graph) {
@@ -610,7 +652,8 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
                                             num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
                                             d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, ev, profile,
                                             use_custom_mma, group_size, use_partial_crt, use_true_fused,
-                                            h_primes, &gemm_launches, mma_variant, use_prologue_fusion);
+                                            h_primes, &gemm_launches, mma_variant, use_prologue_fusion,
+                                            stream2, engine->d_scheme_ii_ev_b);
     }
 
     if (profile) {
