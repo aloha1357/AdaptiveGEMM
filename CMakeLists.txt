@@ -217,6 +217,7 @@ add_test(NAME scheme_ii_fused COMMAND adaptive_gemm_scheme_ii_fused_compare_test
 add_test(NAME scheme_ii_fused_custom_g4 COMMAND adaptive_gemm_scheme_ii_fused_compare_test --scheme_ii_backend custom_mma --scheme_ii_group_size 4)
 add_test(NAME scheme_ii_fused_partial_g4 COMMAND adaptive_gemm_scheme_ii_fused_compare_test --scheme_ii_backend custom_mma --scheme_ii_group_size 4 --use_true_fused_kernel)
 add_test(NAME scheme_ii_fused_true COMMAND adaptive_gemm_scheme_ii_fused_compare_test --scheme_ii_backend custom_mma --scheme_ii_group_size 16 --use_true_fused_kernel)
+add_test(NAME scheme_ii_fused_partial_g4_rect COMMAND adaptive_gemm_scheme_ii_fused_compare_test -M 768 -N 640 -K 1000 --precision_policy Auto --num_moduli 0 --scheme_ii_backend custom_mma --scheme_ii_group_size 4 --use_true_fused_kernel)
 
 if(ADAPTIVEGEMM_BUILD_PYTHON)
     add_test(NAME pytest_binding

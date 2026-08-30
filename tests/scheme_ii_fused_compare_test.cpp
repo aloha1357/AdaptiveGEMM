@@ -25,6 +25,8 @@ int main(int argc, char** argv) {
     bool use_cuda_graph = false;
     bool use_true_fused_kernel = false;
     int group_size = 4;
+    int mma_variant = 0;
+    int prologue_fusion = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -37,6 +39,11 @@ int main(int argc, char** argv) {
         else if (arg == "--scheme_ii_group_size" && i + 1 < argc) group_size = std::atoi(argv[++i]);
         else if (arg == "--use_cuda_graph") use_cuda_graph = true;
         else if (arg == "--use_true_fused_kernel") use_true_fused_kernel = true;
+        else if (arg == "--scheme_ii_mma_variant" && i + 1 < argc) mma_variant = std::atoi(argv[++i]);
+        else if (arg == "--scheme_ii_prologue_fusion" && i + 1 < argc) {
+            std::string fusion = argv[++i];
+            prologue_fusion = (fusion == "tile_local" || fusion == "1") ? 1 : 0;
+        }
     }
 
     ozaki::SchemeIIGemmBackend requested_backend =
@@ -73,6 +80,8 @@ int main(int argc, char** argv) {
         config.scheme_ii_use_true_fused_kernel = (mode == ozaki::ExecutionMode::SchemeII_Fused) && use_true_fused_kernel;
         config.scheme_ii_gemm_backend = backend;
         config.scheme_ii_moduli_group_size = group_size;
+        config.scheme_ii_mma_variant = mma_variant;
+        config.scheme_ii_prologue_fusion = prologue_fusion;
         if (policy_str == "Auto" || num_moduli <= 0) {
             config.precision_policy = ozaki::PrecisionPolicy::Auto;
         } else {
@@ -159,6 +168,8 @@ int main(int argc, char** argv) {
     std::cout << "scheme_ii_group_size=" << contract.scheme_ii_group_size << std::endl;
     std::cout << "scheme_ii_gemm_launches=" << contract.scheme_ii_gemm_launches << std::endl;
     std::cout << "used_partial_crt_epilogue=" << (contract.used_partial_crt_epilogue ? "true" : "false") << std::endl;
+    std::cout << "scheme_ii_mma_variant=" << contract.scheme_ii_mma_variant << std::endl;
+    std::cout << "scheme_ii_prologue_fusion=" << contract.scheme_ii_prologue_fusion << std::endl;
     std::cout << "native_fp64_used=" << (contract.native_fp64_used ? "true" : "false") << std::endl;
     std::cout << "residual_enabled=" << (contract.residual_enabled ? "true" : "false") << std::endl;
 

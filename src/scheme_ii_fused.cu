@@ -14,9 +14,11 @@
 
 namespace ozaki {
 
-// SchemeII fused executor. The cuBLAS backend is staged; the M8 custom backend
-// can group moduli, fuse a partial CRT epilogue, or run the all-moduli CRT
-// epilogue in the MMA kernel. A/B residue quantization is still staged.
+// SchemeII fused executor. The cuBLAS backend is staged; the custom backend
+// can group moduli, fuse a partial CRT epilogue (M8.3 speed path), or run the
+// all-moduli CRT epilogue (M8.4 control). --use_true_fused_kernel with
+// group_size=4 selects M8.3, not full input-to-output fusion. A/B residue
+// quantization stays staged unless --scheme_ii_prologue_fusion tile_local.
 
 static int fused_mod_inverse(int a, int m) {
     int m0 = m, y = 0, x = 1;
@@ -219,7 +221,7 @@ static bool launch_custom_mma_groups(
     int m_pad, int n_pad, int k_pad, int num_moduli, int gsz,
     int8_t* d_A_mod, int8_t* d_B_mod, int32_t* d_C_mod,
     int32_t* d_primes, int32_t* d_inv_table,
-    bool partial_crt, int* launches_out)
+    bool partial_crt, int* launches_out, int mma_variant)
 {
     long long stride_B = (long long)k_pad * n_pad;
     long long stride_A = (long long)m_pad * k_pad;
@@ -253,9 +255,41 @@ static bool launch_custom_mma_groups(
             m_pad, n_pad, k_pad,
             this_g, tmpl,
             d_primes, d_inv_table, p,
-            partial_crt, stream);
+            partial_crt, stream, mma_variant);
         if (st != cudaSuccess) {
             printf("grouped MMA failed with %s at p_idx %d n_group %d\n",
+                   cudaGetErrorString(st), p, this_g);
+            return false;
+        }
+        p += this_g;
+        launches += 1;
+    }
+    if (launches_out) *launches_out = launches;
+    return true;
+}
+
+static bool launch_prologue_mma_groups(
+    cudaStream_t stream,
+    const double* d_A, const double* d_B, int32_t* d_C_mod,
+    const int* d_eA, const int* d_eB,
+    int m, int n, int k, int m_pad, int n_pad, int k_pad,
+    int num_moduli, int gsz, int S,
+    int32_t* d_primes, int mma_variant, int* launches_out)
+{
+    long long stride_C = (long long)m_pad * n_pad;
+    int launches = 0;
+    int p = 0;
+    while (p < num_moduli) {
+        int rem = num_moduli - p;
+        int this_g = rem > gsz ? gsz : rem;
+        if (this_g < 1) this_g = 1;
+        uint32_t* C_out = reinterpret_cast<uint32_t*>(d_C_mod) + (size_t)launches * stride_C;
+        cudaError_t st = scheme_ii_launch_grouped_mma_prologue(
+            d_A, d_B, C_out, d_eA, d_eB,
+            m, n, k, m_pad, n_pad, k_pad,
+            this_g, S, d_primes, p, stream, mma_variant);
+        if (st != cudaSuccess) {
+            printf("tile-local prologue MMA failed with %s at p_idx %d n_group %d\n",
                    cudaGetErrorString(st), p, this_g);
             return false;
         }
@@ -274,7 +308,8 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
                                   int* d_eA, int* d_eB, int8_t* d_A_mod, int8_t* d_B_mod, int32_t* d_C_mod,
                                   cudaEvent_t* ev, bool profile, bool use_custom_mma,
                                   int group_size, bool use_partial_crt, bool use_true_fused,
-                                  const int32_t* h_primes, int* gemm_launches_out) {
+                                  const int32_t* h_primes, int* gemm_launches_out,
+                                  int mma_variant, bool use_prologue_fusion) {
     const int block_size = 256;
     if (profile) cudaEventRecord(ev[0], stream);
     fused_compute_exp_A_kernel<<<(m + block_size - 1) / block_size, block_size, 0, stream>>>(d_A, d_eA, m, k);
@@ -284,13 +319,19 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     if (profile) cudaEventRecord(ev[2], stream);
 
     dim3 block2d(16, 16);
-    dim3 gridA((k_pad + 15) / 16, (m_pad + 15) / 16);
-    fused_quantize_A_kernel<<<gridA, block2d, 0, stream>>>(d_A, d_A_mod, d_eA, m, k, m_pad, k_pad, num_moduli, d_primes, S);
-    if (profile) cudaEventRecord(ev[3], stream);
+    const bool skip_global_quantize = use_custom_mma && use_partial_crt && use_prologue_fusion && !use_true_fused;
+    if (!skip_global_quantize) {
+        dim3 gridA((k_pad + 15) / 16, (m_pad + 15) / 16);
+        fused_quantize_A_kernel<<<gridA, block2d, 0, stream>>>(d_A, d_A_mod, d_eA, m, k, m_pad, k_pad, num_moduli, d_primes, S);
+        if (profile) cudaEventRecord(ev[3], stream);
 
-    dim3 gridB((n_pad + 15) / 16, (k_pad + 15) / 16);
-    fused_quantize_B_kernel<<<gridB, block2d, 0, stream>>>(d_B, d_B_mod, d_eB, k, n, k_pad, n_pad, num_moduli, d_primes, S);
-    if (profile) cudaEventRecord(ev[4], stream);
+        dim3 gridB((n_pad + 15) / 16, (k_pad + 15) / 16);
+        fused_quantize_B_kernel<<<gridB, block2d, 0, stream>>>(d_B, d_B_mod, d_eB, k, n, k_pad, n_pad, num_moduli, d_primes, S);
+        if (profile) cudaEventRecord(ev[4], stream);
+    } else {
+        if (profile) cudaEventRecord(ev[3], stream);
+        if (profile) cudaEventRecord(ev[4], stream);
+    }
 
     long long stride_B = (long long)k_pad * n_pad;
     long long stride_A = (long long)m_pad * k_pad;
@@ -316,11 +357,14 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     if (use_custom_mma) {
         int gsz = group_size < 1 ? 1 : group_size;
         if (gsz > 4) gsz = 4;
-        if (!launch_custom_mma_groups(stream, m_pad, n_pad, k_pad, num_moduli, gsz,
-                                      d_A_mod, d_B_mod, d_C_mod, d_primes, d_inv_table,
-                                      use_partial_crt, &launches)) {
-            return false;
-        }
+        bool ok = skip_global_quantize
+            ? launch_prologue_mma_groups(stream, d_A, d_B, d_C_mod, d_eA, d_eB,
+                                         m, n, k, m_pad, n_pad, k_pad, num_moduli, gsz, S,
+                                         d_primes, mma_variant, &launches)
+            : launch_custom_mma_groups(stream, m_pad, n_pad, k_pad, num_moduli, gsz,
+                                       d_A_mod, d_B_mod, d_C_mod, d_primes, d_inv_table,
+                                       use_partial_crt, &launches, mma_variant);
+        if (!ok) return false;
     } else {
         for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
             cublasStatus_t st = cublasGemmEx(handle,
@@ -342,11 +386,10 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     if (gemm_launches_out) *gemm_launches_out = launches;
     if (profile) cudaEventRecord(ev[5], stream);
 
-    dim3 gridC((n + 15) / 16, (m + 15) / 16);
     if (use_partial_crt) {
         int gsz = group_size < 1 ? 1 : group_size;
         if (gsz > 4) gsz = 4;
-        int32_t h_Mg[20] = {};
+        uint32_t h_Mg[20] = {};
         int32_t h_inv_g[400] = {};
         Int192 h_Pg[20];
         int p = 0;
@@ -356,38 +399,29 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
             if (this_g < 1) this_g = 1;
             uint32_t Mg = 1;
             for (int i = 0; i < this_g; ++i) Mg *= (uint32_t)h_primes[p + i];
-            h_Mg[g] = (int32_t)Mg;
+            h_Mg[g] = Mg;
             if (g == 0) {
                 h_Pg[0].add(1);
             } else {
                 h_Pg[g] = h_Pg[g - 1];
-                h_Pg[g].mul((uint32_t)h_Mg[g - 1]);
+                h_Pg[g].mul(h_Mg[g - 1]);
             }
             p += this_g;
         }
         for (int g = 0; g < launches; ++g) {
             for (int h = g + 1; h < launches; ++h) {
-                h_inv_g[g * 20 + h] = (int32_t)fused_mod_inverse_u32(
-                    (uint32_t)h_Mg[g], (uint32_t)h_Mg[h]);
+                h_inv_g[g * 20 + h] = (int32_t)fused_mod_inverse_u32(h_Mg[g], h_Mg[h]);
             }
         }
-        cudaMemcpy(d_primes, h_Mg, launches * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_primes, h_Mg, launches * sizeof(uint32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_inv_table, h_inv_g, 400 * sizeof(int32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_P, h_Pg, launches * sizeof(Int192), cudaMemcpyHostToDevice);
-        if (launches == 4) {
-            scheme_ii_combine_partial_crt_fixed_kernel<4><<<gridC, block2d, 0, stream>>>(
-                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, S,
-                d_primes, d_inv_table, M, M_half, d_P);
-        } else if (launches == 8) {
-            scheme_ii_combine_partial_crt_fixed_kernel<8><<<gridC, block2d, 0, stream>>>(
-                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, S,
-                d_primes, d_inv_table, M, M_half, d_P);
-        } else {
-            scheme_ii_combine_partial_crt_kernel<<<gridC, block2d, 0, stream>>>(
-                reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad, launches, S,
-                d_primes, d_inv_table, M, M_half, d_P);
-        }
+        scheme_ii_launch_combine_partial_crt(
+            reinterpret_cast<uint32_t*>(d_C_mod), d_C, d_eA, d_eB, m, n, m_pad, n_pad,
+            launches, S, reinterpret_cast<uint32_t*>(d_primes), d_inv_table,
+            M, M_half, d_P, stream);
     } else {
+        dim3 gridC((n + 15) / 16, (m + 15) / 16);
         fused_crt_reconstruct_kernel<<<gridC, block2d, 0, stream>>>(
             d_C_mod, d_C, d_eA, d_eB, m, n, m_pad, n_pad, num_moduli, S, d_primes, d_inv_table, M, M_half, d_P);
     }
@@ -428,9 +462,11 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     bool use_partial_crt = false;
     if (use_custom_mma && config.scheme_ii_use_true_fused_kernel) {
         if (group_size <= 0 || group_size >= num_moduli) {
+            // M8.4 all-moduli true fused control path.
             use_true_fused = true;
             group_size = num_moduli;
         } else {
+            // M8.3/M9 experimental speed path: grouped MMA + partial CRT.
             use_partial_crt = true;
             if (group_size < 2) group_size = 2;
             if (group_size > 4) group_size = 4;
@@ -441,6 +477,8 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     } else {
         group_size = 1;
     }
+    const int mma_variant = config.scheme_ii_mma_variant;
+    const bool use_prologue_fusion = use_partial_crt && (config.scheme_ii_prologue_fusion == 1);
 
     int m_pad = ((m + 127) / 128) * 128;
     int n_pad = ((n + 127) / 128) * 128;
@@ -527,7 +565,7 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
                                       num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
                                       d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, nullptr, false,
                                       use_custom_mma, group_size, use_partial_crt, use_true_fused,
-                                      h_primes, &gemm_launches);
+                                      h_primes, &gemm_launches, mma_variant, use_prologue_fusion);
                 cudaGraph_t graph = nullptr;
                 cap_st = cudaStreamEndCapture(stream, &graph);
                 if (cap_st == cudaSuccess && graph) {
@@ -572,7 +610,7 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
                                             num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
                                             d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, ev, profile,
                                             use_custom_mma, group_size, use_partial_crt, use_true_fused,
-                                            h_primes, &gemm_launches);
+                                            h_primes, &gemm_launches, mma_variant, use_prologue_fusion);
     }
 
     if (profile) {
@@ -629,6 +667,10 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     contract.scheme_ii_backend = use_custom_mma ? "custom_mma" : "cublas";
     contract.scheme_ii_group_size = use_true_fused ? num_moduli : group_size;
     contract.scheme_ii_gemm_launches = gemm_launches;
+    contract.scheme_ii_mma_variant = use_partial_crt
+        ? (mma_variant <= 0 ? scheme_ii_default_mma_variant() : mma_variant)
+        : 0;
+    contract.scheme_ii_prologue_fusion = use_prologue_fusion ? "tile_local" : "none";
     contract.num_moduli = num_moduli;
     if (contract.fallback_mode.empty()) contract.fallback_mode = "None";
 }

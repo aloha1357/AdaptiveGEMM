@@ -73,6 +73,8 @@ struct PrecisionContract {
     int scheme_ii_group_size = 0;
     int scheme_ii_gemm_launches = 0;
     bool used_partial_crt_epilogue = false;
+    int scheme_ii_mma_variant = 0;
+    std::string scheme_ii_prologue_fusion = "none";
     std::vector<PipelineStage> stages;
 };
 
@@ -106,9 +108,14 @@ struct OzakiConfig {
     bool scheme_ii_reuse_workspace = true;
     bool scheme_ii_use_batched_gemm = true;
     bool scheme_ii_use_cuda_graph = false;
+    // --use_true_fused_kernel with group_size < num_moduli selects M8.3
+    // partial CRT (used_partial_crt_epilogue=true, used_true_fused_kernel=false).
+    // group_size >= num_moduli selects M8.4 all-moduli true fused.
     bool scheme_ii_use_true_fused_kernel = false;
     SchemeIIGemmBackend scheme_ii_gemm_backend = SchemeIIGemmBackend::CuBLAS;
     int scheme_ii_moduli_group_size = 4;
+    int scheme_ii_mma_variant = 0;
+    int scheme_ii_prologue_fusion = 0; // 0=none, 1=tile_local
     bool enable_stage_profiling = false;
 
     // Legacy fields (kept for backward compatibility, specifically Phase22)

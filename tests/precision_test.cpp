@@ -68,6 +68,8 @@ int main(int argc, char** argv) {
     std::string policy_str = "Fixed";
     std::string scheme_ii_backend_str = "cublas";
     int scheme_ii_group_size = 4;
+    int scheme_ii_mma_variant = 0;
+    int scheme_ii_prologue_fusion = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -112,6 +114,11 @@ int main(int argc, char** argv) {
             scheme_ii_backend_str = argv[++i];
         } else if (arg == "--scheme_ii_group_size" && i + 1 < argc) {
             scheme_ii_group_size = std::atoi(argv[++i]);
+        } else if (arg == "--scheme_ii_mma_variant" && i + 1 < argc) {
+            scheme_ii_mma_variant = std::atoi(argv[++i]);
+        } else if (arg == "--scheme_ii_prologue_fusion" && i + 1 < argc) {
+            std::string fusion = argv[++i];
+            scheme_ii_prologue_fusion = (fusion == "tile_local" || fusion == "1") ? 1 : 0;
         }
     }
 
@@ -165,6 +172,8 @@ int main(int argc, char** argv) {
         ? SchemeIIGemmBackend::CustomMMA
         : SchemeIIGemmBackend::CuBLAS;
     config.scheme_ii_moduli_group_size = scheme_ii_group_size;
+    config.scheme_ii_mma_variant = scheme_ii_mma_variant;
+    config.scheme_ii_prologue_fusion = scheme_ii_prologue_fusion;
 
     if (policy_str == "Auto" ||
         (mode == ExecutionMode::SchemeI && num_split == 0) ||
@@ -231,6 +240,8 @@ int main(int argc, char** argv) {
         cfg_ii.enable_stage_profiling = false;
         AdaptiveOzakiEngine engine_ii(cfg_ii);
         schemeII_ms = time_engine(engine_ii, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
+        std::vector<double> h_schemeII((size_t)M * N);
+        CHECK_CUDA(cudaMemcpy(h_schemeII.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
         engine_ii.freeWorkspace();
 
         const bool want_custom_mma = (config.scheme_ii_gemm_backend == SchemeIIGemmBackend::CustomMMA);
@@ -241,8 +252,10 @@ int main(int argc, char** argv) {
         AdaptiveOzakiEngine engine_fused_cublas(cfg_fused_cublas);
         schemeII_fused_cublas_ms = time_engine(engine_fused_cublas, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
         PrecisionContract contract_cublas = engine_fused_cublas.getPrecisionContract();
+        std::vector<double> h_cublas_backend((size_t)M * N);
+        CHECK_CUDA(cudaMemcpy(h_cublas_backend.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
         if (!want_custom_mma) {
-            CHECK_CUDA(cudaMemcpy(h_result.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
+            h_result = h_cublas_backend;
         }
         engine_fused_cublas.freeWorkspace();
 
@@ -252,15 +265,19 @@ int main(int argc, char** argv) {
         AdaptiveOzakiEngine engine_fused_mma(cfg_fused_mma);
         schemeII_fused_custom_mma_ms = time_engine(engine_fused_mma, d_A, d_B, d_C, M, N, K, repeat, start_fp64, stop_fp64);
         PrecisionContract contract_mma = engine_fused_mma.getPrecisionContract();
+        std::vector<double> h_custom((size_t)M * N);
+        CHECK_CUDA(cudaMemcpy(h_custom.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
         if (want_custom_mma) {
-            CHECK_CUDA(cudaMemcpy(h_result.data(), d_C, (size_t)M * N * sizeof(double), cudaMemcpyDeviceToHost));
+            h_result = h_custom;
         }
 
         schemeII_fused_ms = want_custom_mma ? schemeII_fused_custom_mma_ms : schemeII_fused_cublas_ms;
         PrecisionContract contract = want_custom_mma ? contract_mma : contract_cublas;
 
-        double rms_error = 0.0, max_rel_error = 0.0;
+        double rms_error = 0.0, max_rel_error = 0.0, dummy_rms = 0.0, dummy_rel = 0.0;
         double max_abs_error = compute_max_error(h_reference, h_result, rms_error, max_rel_error);
+        double max_abs_custom_vs_schemeII = compute_max_error(h_schemeII, h_custom, dummy_rms, dummy_rel);
+        double max_abs_custom_vs_cublas_backend = compute_max_error(h_cublas_backend, h_custom, dummy_rms, dummy_rel);
         bool passed = (max_rel_error <= 1e-6) && !contract.native_fp64_used && !contract.residual_enabled;
         if (want_custom_mma) {
             passed = passed && contract.used_custom_mma && contract.scheme_ii_backend == "custom_mma";
@@ -280,6 +297,10 @@ int main(int argc, char** argv) {
         std::cout << "scheme_ii_group_size=" << contract.scheme_ii_group_size << "\n";
         std::cout << "scheme_ii_gemm_launches=" << contract.scheme_ii_gemm_launches << "\n";
         std::cout << "used_partial_crt_epilogue=" << (contract.used_partial_crt_epilogue ? "true" : "false") << "\n";
+        std::cout << "scheme_ii_mma_variant=" << contract.scheme_ii_mma_variant << "\n";
+        std::cout << "scheme_ii_prologue_fusion=" << contract.scheme_ii_prologue_fusion << "\n";
+        std::cout << "max_abs_custom_vs_schemeII=" << max_abs_custom_vs_schemeII << "\n";
+        std::cout << "max_abs_custom_vs_cublas_backend=" << max_abs_custom_vs_cublas_backend << "\n";
         std::cout << "fallback_mode=" << (contract.fallback_mode.empty() ? "None" : contract.fallback_mode) << "\n";
         std::cout << "num_moduli=" << contract.num_moduli << "\n";
         std::cout << "max_abs_error=" << max_abs_error << "\n";
@@ -309,6 +330,10 @@ int main(int argc, char** argv) {
                   << " scheme_ii_group_size=" << contract.scheme_ii_group_size
                   << " scheme_ii_gemm_launches=" << contract.scheme_ii_gemm_launches
                   << " used_partial_crt_epilogue=" << (contract.used_partial_crt_epilogue ? "true" : "false")
+                  << " scheme_ii_mma_variant=" << contract.scheme_ii_mma_variant
+                  << " scheme_ii_prologue_fusion=" << contract.scheme_ii_prologue_fusion
+                  << " max_abs_custom_vs_schemeII=" << max_abs_custom_vs_schemeII
+                  << " max_abs_custom_vs_cublas_backend=" << max_abs_custom_vs_cublas_backend
                   << std::endl;
 
         engine_fused_mma.freeWorkspace();

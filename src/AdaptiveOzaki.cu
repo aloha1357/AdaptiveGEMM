@@ -1484,6 +1484,8 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
     current_contract_.scheme_ii_group_size = 0;
     current_contract_.scheme_ii_gemm_launches = 0;
     current_contract_.used_partial_crt_epilogue = false;
+    current_contract_.scheme_ii_mma_variant = 0;
+    current_contract_.scheme_ii_prologue_fusion = "none";
     current_contract_.passed_precision_gate = false;
     current_contract_.max_relative_error = -1.0;
     current_contract_.stages.clear();
