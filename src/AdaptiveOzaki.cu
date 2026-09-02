@@ -1,10 +1,12 @@
-﻿#include "AdaptiveOzaki.h"
+#include "AdaptiveOzaki.h"
 #include "scheme_i.h"
 #include "scheme_ii.h"
 #include "int8_gemm.h"
 #include "scheme_ii_gpu.h"
 #include "scheme_ii_fused.h"
 #include "scheme_ii_moduli.h"
+#include "dd_moduli_table.h"
+#include "UInt384.h"
 #include "mma_sm89.cuh"
 #include <iostream>
 #include <cmath>
@@ -102,30 +104,32 @@ __device__ __forceinline__ double fp64_hi(double v, int split_bits) {
 
 namespace ozaki {
 
-static int scheme_ii_choose_num_moduli(int k, int target_bits, int requested, PrecisionPolicy policy) {
+static int scheme_ii_choose_num_moduli(int k, int target_bits, int requested, PrecisionPolicy policy, const std::string& input_type = "FP64") {
     int nmod = requested;
     if (policy == PrecisionPolicy::Auto || requested <= 0) {
-        int required_crt_bits = target_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+        int input_bits = (input_type == "DoubleDouble") ? 106 : target_bits;
+        int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
         double log2_prod = 0.0;
-        nmod = 20;
-        for (int i = 0; i < 20; ++i) {
-            log2_prod += std::log2((double)MODULI_INT8[i]);
+        nmod = MAX_MODULI_INT8;
+        for (int i = 0; i < MAX_MODULI_INT8; ++i) {
+            log2_prod += std::log2((double)MODULI_INT8_EXTENDED[i]);
             if (log2_prod >= required_crt_bits) {
                 nmod = i + 1;
                 break;
             }
         }
     }
-    if (nmod > 20) nmod = 20;
+    if (nmod > MAX_MODULI_INT8) nmod = MAX_MODULI_INT8;
     return nmod;
 }
 
-static bool scheme_ii_condition_B(int num_moduli, int k, int target_bits) {
+static bool scheme_ii_condition_B(int num_moduli, int k, int target_bits, const std::string& input_type = "FP64") {
     double log2_prod = 0.0;
-    for (int i = 0; i < num_moduli && i < 20; ++i) {
-        log2_prod += std::log2((double)MODULI_INT8[i]);
+    for (int i = 0; i < num_moduli && i < MAX_MODULI_INT8; ++i) {
+        log2_prod += std::log2((double)MODULI_INT8_EXTENDED[i]);
     }
-    int required_crt_bits = target_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+    int input_bits = (input_type == "DoubleDouble") ? 106 : target_bits;
+    int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
     return log2_prod < required_crt_bits;
 }
 
@@ -173,29 +177,23 @@ void AdaptiveOzakiEngine::allocateWorkspace(int m, int n, int k) {
     if (config_.mode == ExecutionMode::SchemeII || config_.mode == ExecutionMode::SchemeII_Fused) {
         int m_pad = ((m + 127) / 128) * 128;
         int n_pad = ((n + 127) / 128) * 128;
-        // Custom MMA requires k % 64 == 0 (BK=64). Size fused workspace for that
-        // so either cuBLAS or custom MMA can run from the same buffers.
-        int k_pad = (config_.mode == ExecutionMode::SchemeII_Fused)
-                        ? ((k + 63) / 64) * 64
-                        : ((k + 31) / 32) * 32;
-        int num_moduli = std::max(current_plan_.num_moduli, config_.scheme_ii_num_moduli);
-        if (num_moduli < 2) num_moduli = 15;
-        if (num_moduli > 20) num_moduli = 20;
-
+        int k_pad = ((k + 63) / 64) * 64;
+        int num_moduli = MAX_MODULI_INT8;
         auto check_malloc = [](cudaError_t err, const char* what) {
             if (err != cudaSuccess) {
                 throw std::runtime_error(std::string("SchemeII workspace cudaMalloc failed: ") + what);
             }
         };
-        check_malloc(cudaMalloc(&d_scheme_ii_primes, 20 * sizeof(int32_t)), "primes");
-        check_malloc(cudaMalloc(&d_scheme_ii_inv_table, 400 * sizeof(int32_t)), "inv_table");
-        check_malloc(cudaMalloc(&d_scheme_ii_P, 20 * sizeof(Int192)), "P");
+        check_malloc(cudaMalloc(&d_scheme_ii_primes, MAX_MODULI_INT8 * sizeof(int32_t)), "primes");
+        check_malloc(cudaMalloc(&d_scheme_ii_inv_table, MAX_MODULI_INT8 * MAX_MODULI_INT8 * sizeof(int32_t)), "inv_table");
+        check_malloc(cudaMalloc(&d_scheme_ii_P, MAX_MODULI_INT8 * sizeof(Int192)), "P");
         check_malloc(cudaMalloc(&d_scheme_ii_eA, m * sizeof(int)), "eA");
         check_malloc(cudaMalloc(&d_scheme_ii_eB, n * sizeof(int)), "eB");
         size_t A_bytes = (size_t)num_moduli * m_pad * k_pad * sizeof(int8_t);
         size_t B_bytes = (size_t)num_moduli * k_pad * n_pad * sizeof(int8_t);
         check_malloc(cudaMalloc(&d_scheme_ii_A_mod, A_bytes), "A_mod");
         check_malloc(cudaMalloc(&d_scheme_ii_B_mod, B_bytes), "B_mod");
+        check_malloc(cudaMalloc(&d_scheme_ii_B_mod_nk, B_bytes), "B_mod_nk");
         size_t C_bytes = (size_t)num_moduli * m_pad * n_pad * sizeof(int32_t);
         check_malloc(cudaMalloc(&d_scheme_ii_C_mod, C_bytes), "C_mod");
         d_scheme_ii_ws_num_moduli = num_moduli;
@@ -298,6 +296,7 @@ void AdaptiveOzakiEngine::freeWorkspace() {
     cudaFree(d_scheme_ii_eB); d_scheme_ii_eB = nullptr;
     cudaFree(d_scheme_ii_A_mod); d_scheme_ii_A_mod = nullptr;
     cudaFree(d_scheme_ii_B_mod); d_scheme_ii_B_mod = nullptr;
+    cudaFree(d_scheme_ii_B_mod_nk); d_scheme_ii_B_mod_nk = nullptr;
     cudaFree(d_scheme_ii_C_mod); d_scheme_ii_C_mod = nullptr;
     cudaFree(d_global_work_queue); d_global_work_queue = nullptr;
     
@@ -1458,6 +1457,316 @@ __global__ void hybrid_ozaki_persistent_kernel(
     }
 }
 
+void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB, DoubleDouble* dC, const GEMMInput& input) {
+    if (input.op_A != "N" || input.op_B != "N") {
+        current_contract_.failure_reason = "Transpose not supported yet";
+        return;
+    }
+    if (input.beta != 0.0) {
+        current_contract_.failure_reason = "Non-zero beta not supported yet";
+        return;
+    }
+    execute(dA, dB, dC, input.M, input.N, input.K);
+}
+
+void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB, DoubleDouble* dC, int m, int n, int k) {
+    current_contract_.mode = "SchemeII";
+    current_contract_.input_type = "DoubleDouble";
+    current_contract_.target_mantissa_bits = 106;
+    current_contract_.native_fp64_used = false;
+    current_contract_.residual_enabled = false;
+    current_contract_.residual_used = false;
+    current_contract_.fallback_mode = "None";
+    
+    int num_moduli = scheme_ii_choose_num_moduli(k, 106, config_.scheme_ii_num_moduli, config_.precision_policy, "DoubleDouble");
+    current_contract_.num_moduli = num_moduli;
+    current_contract_.required_crt_bits = 2 * 106 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+    
+    double log2_prod = 0.0;
+    for (int i = 0; i < num_moduli; ++i) {
+        log2_prod += std::log2((double)MODULI_INT8_EXTENDED[i]);
+    }
+    current_contract_.crt_bits = (int)log2_prod;
+    
+    if (log2_prod < current_contract_.required_crt_bits) {
+        current_contract_.failure_reason = "Insufficient CRT bits for DoubleDouble";
+        throw std::runtime_error("Insufficient CRT bits for DoubleDouble");
+    }
+    
+    if (current_contract_.required_crt_bits > 384) {
+        current_contract_.failure_reason = "Insufficient integer width";
+        throw std::runtime_error("Insufficient integer width");
+    }
+
+    std::vector<DoubleDouble> h_A(m * k);
+    std::vector<DoubleDouble> h_B(k * n);
+    cudaMemcpy(h_A.data(), dA, m * k * sizeof(DoubleDouble), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_B.data(), dB, k * n * sizeof(DoubleDouble), cudaMemcpyDeviceToHost);
+    
+    double max_hi_A = 0.0;
+    for (int i=0; i<m*k; ++i) max_hi_A = std::max(max_hi_A, std::abs(h_A[i].hi));
+    double max_hi_B = 0.0;
+    for (int i=0; i<k*n; ++i) max_hi_B = std::max(max_hi_B, std::abs(h_B[i].hi));
+    
+    int s_A = max_hi_A > 0 ? 106 - (int)std::floor(std::log2(max_hi_A)) : 0;
+    int s_B = max_hi_B > 0 ? 106 - (int)std::floor(std::log2(max_hi_B)) : 0;
+    double scale_A = std::ldexp(1.0, s_A);
+    double scale_B = std::ldexp(1.0, s_B);
+    
+    int m_pad = ((m + 127) / 128) * 128;
+    int n_pad = ((n + 127) / 128) * 128;
+    int k_pad = ((k + 63) / 64) * 64;
+
+    std::vector<std::vector<int8_t>> A_mod(num_moduli, std::vector<int8_t>(m_pad * k_pad, 0));
+    std::vector<std::vector<int8_t>> B_mod(num_moduli, std::vector<int8_t>(k_pad * n_pad, 0));
+    std::vector<std::vector<int32_t>> C_mod(num_moduli, std::vector<int32_t>(m_pad * n_pad, 0));
+    
+    auto dd_to_mod = [](DoubleDouble val, int scale_log2, int p) -> int8_t {
+        uint64_t words[3] = {0, 0, 0};
+        bool is_neg = val.hi < 0;
+        double abs_hi = std::abs(val.hi);
+        double abs_lo = is_neg ? -val.lo : val.lo;
+        
+        auto add_to_words = [&words](double x, int scale) {
+            if (x == 0.0) return;
+            bool x_neg = x < 0;
+            x = std::abs(x);
+            int exp;
+            double frac = std::frexp(x, &exp);
+            uint64_t m = (uint64_t)std::round(frac * 9007199254740992.0);
+            int shift = exp - 53 + scale;
+            
+            uint64_t add_words[3] = {0, 0, 0};
+            if (shift >= 0) {
+                int w_shift = shift / 64;
+                int b_shift = shift % 64;
+                if (w_shift < 3) {
+                    add_words[w_shift] = m << b_shift;
+                    if (b_shift > 0 && w_shift + 1 < 3) {
+                        add_words[w_shift + 1] = m >> (64 - b_shift);
+                    }
+                }
+            } else if (shift > -64) {
+                add_words[0] = m >> (-shift);
+            }
+            
+            if (!x_neg) {
+                uint64_t carry = 0;
+                for (int i = 0; i < 3; ++i) {
+                    uint64_t sum = words[i] + add_words[i] + carry;
+                    carry = (sum < words[i] || (carry && sum == words[i])) ? 1 : 0;
+                    words[i] = sum;
+                }
+            } else {
+                uint64_t borrow = 0;
+                for (int i = 0; i < 3; ++i) {
+                    uint64_t diff = words[i] - add_words[i] - borrow;
+                    borrow = (words[i] < add_words[i] || (borrow && words[i] == add_words[i])) ? 1 : 0;
+                    words[i] = diff;
+                }
+            }
+        };
+        
+        add_to_words(abs_hi, scale_log2);
+        add_to_words(abs_lo, scale_log2);
+        
+        long long rem = 0;
+        long long p_ll = p;
+        for (int i = 2; i >= 0; --i) {
+            uint32_t hi32 = words[i] >> 32;
+            uint32_t lo32 = words[i] & 0xFFFFFFFF;
+            rem = (rem * 4294967296LL + hi32) % p_ll;
+            rem = (rem * 4294967296LL + lo32) % p_ll;
+        }
+        
+        if (is_neg) {
+            rem = p_ll - rem;
+            if (rem == p_ll) rem = 0;
+        }
+        
+        if (rem > p / 2) {
+            rem -= p;
+        }
+        
+        return (int8_t)(rem);
+    };
+    
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        int prime = MODULI_INT8_EXTENDED[p_idx];
+        
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < k; ++c) {
+                A_mod[p_idx][r * k_pad + c] = dd_to_mod(h_A[r * k + c], s_A, prime);
+            }
+        }
+        for (int r = 0; r < k; ++r) {
+            for (int c = 0; c < n; ++c) {
+                B_mod[p_idx][r * n_pad + c] = dd_to_mod(h_B[r * n + c], s_B, prime);
+            }
+        }
+
+        cudaMemcpy(d_scheme_ii_A_mod + p_idx * m_pad * k_pad, A_mod[p_idx].data(), m_pad * k_pad * sizeof(int8_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_scheme_ii_B_mod + p_idx * k_pad * n_pad, B_mod[p_idx].data(), k_pad * n_pad * sizeof(int8_t), cudaMemcpyHostToDevice);
+        
+        int alpha = 1;
+        int beta = 0;
+        cublasStatus_t status = cublasGemmEx(cublas_handle_,
+                     CUBLAS_OP_N, CUBLAS_OP_N,
+                     n_pad, m_pad, k_pad,
+                     &alpha,
+                     d_scheme_ii_B_mod + p_idx * k_pad * n_pad, CUDA_R_8I, n_pad,
+                     d_scheme_ii_A_mod + p_idx * m_pad * k_pad, CUDA_R_8I, k_pad,
+                     &beta,
+                     d_scheme_ii_C_mod + p_idx * m_pad * n_pad, CUDA_R_32I, n_pad,
+                     CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            std::cerr << "cuBLAS GEMM failed with status: " << status << " for p_idx: " << p_idx << std::endl;
+        }
+                     
+        cudaMemcpy(C_mod[p_idx].data(), d_scheme_ii_C_mod + p_idx * m_pad * n_pad, m_pad * n_pad * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    }
+    
+    std::vector<int32_t> residues(num_moduli);
+    std::vector<DoubleDouble> h_C(m * n);
+    
+    UInt384 M_total(1);
+    for (int p = 0; p < num_moduli; ++p) {
+        M_total = M_total * (uint32_t)MODULI_INT8_EXTENDED[p];
+    }
+    
+    std::vector<UInt384> M_i(num_moduli);
+    std::vector<uint32_t> M_i_inv(num_moduli);
+    
+    auto modInverse = [](uint32_t a, uint32_t m) -> uint32_t {
+        int32_t m0 = m, t, q;
+        int32_t x0 = 0, x1 = 1;
+        if (m == 1) return 0;
+        while (a > 1) {
+            q = a / m;
+            t = m;
+            m = a % m;
+            a = t;
+            t = x0;
+            x0 = x1 - q * x0;
+            x1 = t;
+        }
+        if (x1 < 0) x1 += m0;
+        return (uint32_t)x1;
+    };
+    
+    for (int p = 0; p < num_moduli; ++p) {
+        UInt384 mi(1);
+        for (int j = 0; j < num_moduli; ++j) {
+            if (p != j) mi = mi * (uint32_t)MODULI_INT8_EXTENDED[j];
+        }
+        M_i[p] = mi;
+        uint32_t mi_mod = mi % (uint32_t)MODULI_INT8_EXTENDED[p];
+        M_i_inv[p] = modInverse(mi_mod, (uint32_t)MODULI_INT8_EXTENDED[p]);
+    }
+    
+    UInt384 half_M = M_total >> 1;
+    double scale_out = std::ldexp(1.0, -(s_A + s_B));
+    
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < n; ++c) {
+            int i = r * n + c;
+            UInt384 res(0);
+            for (int p = 0; p < num_moduli; ++p) {
+                int prime = MODULI_INT8_EXTENDED[p];
+                long long target_mod = (long long)C_mod[p][r * n_pad + c];
+                
+                target_mod = target_mod % prime;
+                if (target_mod < 0) target_mod += prime;
+                
+                uint32_t rem = (uint32_t)target_mod;
+                uint32_t term = ((uint64_t)rem * M_i_inv[p]) % prime;
+            
+            // We need res = (res + M_i[p] * term) % M_total;
+            UInt384 addend = M_i[p] * term;
+            res = res + addend;
+        }
+        
+        // Manual mod M_total for UInt384 is complex, but since res is sum of (term * M_i), 
+        // max value is num_moduli * M_total. So we can just subtract M_total repeatedly.
+        for (int j = 0; j < num_moduli; ++j) {
+            if (!(res < M_total)) res = res - M_total;
+        }
+        
+        bool is_negative = !(res < half_M);
+        if (is_negative) {
+            UInt384 abs_res = M_total - res;
+            // Convert to double
+            double hi = 0.0, lo = 0.0;
+            for (int w = 5; w >= 0; --w) {
+                hi = hi * 18446744073709551616.0 + abs_res.words[w];
+            }
+            hi = -hi * scale_out;
+            h_C[i] = DoubleDouble(hi, 0.0); // Wait, this doesn't preserve DoubleDouble fully. We need a better conversion.
+        } else {
+            double hi = 0.0;
+            for (int w = 5; w >= 0; --w) {
+                hi = hi * 18446744073709551616.0 + res.words[w];
+            }
+            hi = hi * scale_out;
+            h_C[i] = DoubleDouble(hi, 0.0);
+        }
+        
+        // To preserve DoubleDouble, we must do division carefully.
+        // C_dd.hi = (double)(C_int) * scale_out
+        // C_dd.lo = (double)(C_int - C_dd.hi / scale_out) * scale_out
+        // Let's refine the conversion.
+        
+        double C_hi, C_lo;
+        if (is_negative) {
+            UInt384 abs_res = M_total - res;
+            double approx = 0.0;
+            for (int w = 5; w >= 0; --w) {
+                approx = approx * 18446744073709551616.0 + abs_res.words[w];
+            }
+            C_hi = -approx * scale_out;
+            
+            // Now compute residual: C_int - C_hi / scale_out
+            // Wait, simple DoubleDouble conversion:
+            // hi = (double)val * scale
+            // lo = (double)(val - (UInt384)(hi/scale)) * scale
+            // Let's just use DoubleDouble(C_hi, 0.0) for now, wait, the test requires lo to be preserved!
+        } else {
+            double approx = 0.0;
+            for (int w = 5; w >= 0; --w) {
+                approx = approx * 18446744073709551616.0 + res.words[w];
+            }
+            C_hi = approx * scale_out;
+        }
+        
+        // Improved DoubleDouble conversion to preserve lo:
+        // C_int (UInt384) -> DoubleDouble
+        // 1. Double C_hi = sum(words[w] * 2^(64*w)) * scale_out
+        // 2. We can convert word by word and accumulate using TwoSum!
+        DoubleDouble val(0.0, 0.0);
+        UInt384 abs_res = is_negative ? (M_total - res) : res;
+        for (int w = 5; w >= 0; --w) {
+            uint32_t high32 = abs_res.words[w] >> 32;
+            uint32_t low32 = abs_res.words[w] & 0xFFFFFFFF;
+            if (high32) {
+                double term_hi = (double)high32 * std::ldexp(1.0, 64 * w + 32) * scale_out;
+                val = val + DoubleDouble(term_hi, 0.0);
+            }
+            if (low32) {
+                double term_lo = (double)low32 * std::ldexp(1.0, 64 * w) * scale_out;
+                val = val + DoubleDouble(term_lo, 0.0);
+            }
+        }
+        if (is_negative) {
+            val.hi = -val.hi;
+            val.lo = -val.lo;
+        }
+        h_C[i] = val;
+    }
+    }
+    
+    cudaMemcpy(dC, h_C.data(), m * n * sizeof(DoubleDouble), cudaMemcpyHostToDevice);
+}
+
 void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, const GEMMInput& input) {
     // Basic wrapper, no beta/transpose handling yet except failing if needed
     if (input.op_A != "N" || input.op_B != "N") {
@@ -1782,8 +2091,8 @@ void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC
             }
         }
 
-        if (!d_scheme_ii_A_mod || !d_scheme_ii_B_mod || !d_scheme_ii_C_mod ||
-            !d_scheme_ii_eA || !d_scheme_ii_eB) {
+        if (!d_scheme_ii_A_mod || !d_scheme_ii_B_mod || !d_scheme_ii_B_mod_nk ||
+            !d_scheme_ii_C_mod || !d_scheme_ii_eA || !d_scheme_ii_eB) {
             current_contract_.fallback_mode = "SchemeII";
             current_contract_.failure_reason = "SchemeII_Fused workspace missing";
             execute_scheme_ii_gpu(cublas_handle_, dA, dB, dC, m, n, k, current_plan_.num_moduli);

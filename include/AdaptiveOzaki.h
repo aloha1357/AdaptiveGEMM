@@ -1,4 +1,5 @@
-﻿#include "scheme_ii_int192.h"
+#include "scheme_ii_int192.h"
+#include "DoubleDouble.h"
 #pragma once
 
 #include <cuda_runtime.h>
@@ -54,10 +55,13 @@ struct SchemePlan {
 
 struct PrecisionContract {
     std::string mode;
+    std::string input_type = "FP64";
     int target_mantissa_bits = 53;
     int num_split = 0;
     int bits_per_int8 = 0;
     int num_moduli = 0;
+    int crt_bits = 0;
+    int required_crt_bits = 0;
     bool residual_enabled = false;
     bool residual_used = false;
     bool native_fp64_used = false;
@@ -117,6 +121,7 @@ struct OzakiConfig {
     int scheme_ii_mma_variant = 0;
     int scheme_ii_prologue_fusion = 0; // 0=none, 1=tile_local
     bool enable_stage_profiling = false;
+    std::string scheme_ii_ablate = "";
 
     // Legacy fields (kept for backward compatibility, specifically Phase22)
     double target_epsilon = 1e-10;
@@ -151,6 +156,8 @@ public:
 
     void execute(const double* d_A, const double* d_B, double* d_C, int m, int n, int k);
     void execute(const double* d_A, const double* d_B, double* d_C, const GEMMInput& input);
+    void execute(const DoubleDouble* d_A, const DoubleDouble* d_B, DoubleDouble* d_C, int m, int n, int k);
+    void execute(const DoubleDouble* d_A, const DoubleDouble* d_B, DoubleDouble* d_C, const GEMMInput& input);
 
     // Workspace management
     void allocateWorkspace(int m, int n, int k);
@@ -211,6 +218,8 @@ public:
     int* d_scheme_ii_eB = nullptr;
     int8_t* d_scheme_ii_A_mod = nullptr;
     int8_t* d_scheme_ii_B_mod = nullptr;
+    // N-major (K-contiguous) copy of B_mod for custom grouped MMA Path A.
+    int8_t* d_scheme_ii_B_mod_nk = nullptr;
     int32_t* d_scheme_ii_C_mod = nullptr;
     int32_t* d_scheme_ii_primes = nullptr;
     int32_t* d_scheme_ii_inv_table = nullptr;

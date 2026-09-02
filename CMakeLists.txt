@@ -211,6 +211,19 @@ target_link_libraries(adaptive_gemm_scheme_i_test
 
 add_test(NAME scheme_i COMMAND adaptive_gemm_scheme_i_test)
 
+add_executable(adaptive_gemm_int8_roofline_test
+    tests/int8_roofline_test.cpp
+)
+
+target_link_libraries(adaptive_gemm_int8_roofline_test
+    PRIVATE
+        adaptive_gemm
+        CUDA::cublas
+        CUDA::cudart
+)
+
+add_test(NAME int8_roofline COMMAND adaptive_gemm_int8_roofline_test)
+
 add_executable(adaptive_gemm_scheme_ii_fused_compare_test tests/scheme_ii_fused_compare_test.cpp)
 target_link_libraries(adaptive_gemm_scheme_ii_fused_compare_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
 add_test(NAME scheme_ii_fused COMMAND adaptive_gemm_scheme_ii_fused_compare_test)
@@ -219,6 +232,13 @@ add_test(NAME scheme_ii_fused_partial_g4 COMMAND adaptive_gemm_scheme_ii_fused_c
 add_test(NAME scheme_ii_fused_true COMMAND adaptive_gemm_scheme_ii_fused_compare_test --scheme_ii_backend custom_mma --scheme_ii_group_size 16 --use_true_fused_kernel)
 add_test(NAME scheme_ii_fused_partial_g4_rect COMMAND adaptive_gemm_scheme_ii_fused_compare_test -M 768 -N 640 -K 1000 --precision_policy Auto --num_moduli 0 --scheme_ii_backend custom_mma --scheme_ii_group_size 4 --use_true_fused_kernel)
 
+add_executable(adaptive_gemm_dd_test tests/dd_gemm_test.cpp)
+target_link_libraries(adaptive_gemm_dd_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
+add_test(NAME dd_gemm COMMAND adaptive_gemm_dd_test)
+
+add_executable(adaptive_gemm_dd_error_128_test tests/dd_error_128_test.cpp)
+target_link_libraries(adaptive_gemm_dd_error_128_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
+add_test(NAME dd_error_128 COMMAND adaptive_gemm_dd_error_128_test)
 if(ADAPTIVEGEMM_BUILD_PYTHON)
     add_test(NAME pytest_binding
         COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py
