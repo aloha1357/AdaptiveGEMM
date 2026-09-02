@@ -232,8 +232,11 @@ static bool run_case(const std::string& name,
               << "timing_ms cpu_dd_oracle=" << cpu_dd_ms
               << " cpu_fp64=" << cpu_fp64_ms
               << " engine_dd_avg3=" << engine.execute_ms
-              << "\n"
-              << std::scientific << std::setprecision(6);
+              << "\n";
+    for (const auto& stg : contract.stages) {
+        std::cout << "  stage " << stg.stage_name << " " << stg.stage_timing << " ms\n";
+    }
+    std::cout << std::scientific << std::setprecision(6);
     std::cout << "C[0,0] got hi=" << got[0].hi << " lo=" << got[0].lo << "\n";
     std::cout << "C[0,0] ref hi=" << ref[0].hi << " lo=" << ref[0].lo << "\n";
     std::cout << "C[0,0] fp64=" << fp64[0] << "\n";

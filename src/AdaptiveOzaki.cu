@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <vector>
 #include <mma.h>
 #include <cuda_fp16.h>
 
@@ -1517,39 +1519,41 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
     int n_pad = ((n + 127) / 128) * 128;
     int k_pad = ((k + 63) / 64) * 64;
 
-    std::vector<std::vector<int8_t>> A_mod(num_moduli, std::vector<int8_t>(m_pad * k_pad, 0));
-    std::vector<std::vector<int8_t>> B_mod(num_moduli, std::vector<int8_t>(k_pad * n_pad, 0));
-    std::vector<std::vector<int32_t>> C_mod(num_moduli, std::vector<int32_t>(m_pad * n_pad, 0));
+    current_contract_.stages.clear();
+    const auto t_ser0 = std::chrono::steady_clock::now();
+    const size_t a_stride = (size_t)m_pad * k_pad;
+    const size_t b_stride = (size_t)k_pad * n_pad;
+    const size_t c_stride = (size_t)m_pad * n_pad;
+    std::vector<int8_t> A_mod((size_t)num_moduli * a_stride, 0);
+    std::vector<int8_t> B_mod((size_t)num_moduli * b_stride, 0);
     
-    auto dd_to_mod = [](DoubleDouble val, int scale_log2, int p) -> int8_t {
-        uint64_t words[3] = {0, 0, 0};
-        bool is_neg = val.hi < 0;
+    auto dd_to_words = [](DoubleDouble val, int scale_log2, uint64_t words[3], bool* is_neg) {
+        words[0] = words[1] = words[2] = 0;
+        *is_neg = val.hi < 0;
         double abs_hi = std::abs(val.hi);
-        double abs_lo = is_neg ? -val.lo : val.lo;
-        
-        auto add_to_words = [&words](double x, int scale) {
+        double abs_lo = *is_neg ? -val.lo : val.lo;
+
+        auto add_to_words = [&](double x, int scale) {
             if (x == 0.0) return;
             bool x_neg = x < 0;
             x = std::abs(x);
             int exp;
             double frac = std::frexp(x, &exp);
-            uint64_t m = (uint64_t)std::round(frac * 9007199254740992.0);
+            uint64_t mant = (uint64_t)std::round(frac * 9007199254740992.0);
             int shift = exp - 53 + scale;
-            
             uint64_t add_words[3] = {0, 0, 0};
             if (shift >= 0) {
                 int w_shift = shift / 64;
                 int b_shift = shift % 64;
                 if (w_shift < 3) {
-                    add_words[w_shift] = m << b_shift;
+                    add_words[w_shift] = mant << b_shift;
                     if (b_shift > 0 && w_shift + 1 < 3) {
-                        add_words[w_shift + 1] = m >> (64 - b_shift);
+                        add_words[w_shift + 1] = mant >> (64 - b_shift);
                     }
                 }
             } else if (shift > -64) {
-                add_words[0] = m >> (-shift);
+                add_words[0] = mant >> (-shift);
             }
-            
             if (!x_neg) {
                 uint64_t carry = 0;
                 for (int i = 0; i < 3; ++i) {
@@ -1566,65 +1570,77 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
                 }
             }
         };
-        
         add_to_words(abs_hi, scale_log2);
         add_to_words(abs_lo, scale_log2);
-        
+    };
+    auto words_to_res = [](const uint64_t words[3], int p, bool is_neg) -> int8_t {
         long long rem = 0;
         long long p_ll = p;
         for (int i = 2; i >= 0; --i) {
-            uint32_t hi32 = words[i] >> 32;
-            uint32_t lo32 = words[i] & 0xFFFFFFFF;
+            uint32_t hi32 = (uint32_t)(words[i] >> 32);
+            uint32_t lo32 = (uint32_t)(words[i] & 0xFFFFFFFFu);
             rem = (rem * 4294967296LL + hi32) % p_ll;
             rem = (rem * 4294967296LL + lo32) % p_ll;
         }
-        
         if (is_neg) {
             rem = p_ll - rem;
             if (rem == p_ll) rem = 0;
         }
-        
-        if (rem > p / 2) {
-            rem -= p;
-        }
-        
-        return (int8_t)(rem);
+        if (rem > p / 2) rem -= p;
+        return (int8_t)rem;
     };
-    
-    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
-        int prime = MODULI_INT8_EXTENDED[p_idx];
-        
-        for (int r = 0; r < m; ++r) {
-            for (int c = 0; c < k; ++c) {
-                A_mod[p_idx][r * k_pad + c] = dd_to_mod(h_A[r * k + c], s_A, prime);
-            }
-        }
-        for (int r = 0; r < k; ++r) {
-            for (int c = 0; c < n; ++c) {
-                B_mod[p_idx][r * n_pad + c] = dd_to_mod(h_B[r * n + c], s_B, prime);
-            }
-        }
 
-        cudaMemcpy(d_scheme_ii_A_mod + p_idx * m_pad * k_pad, A_mod[p_idx].data(), m_pad * k_pad * sizeof(int8_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_scheme_ii_B_mod + p_idx * k_pad * n_pad, B_mod[p_idx].data(), k_pad * n_pad * sizeof(int8_t), cudaMemcpyHostToDevice);
-        
-        int alpha = 1;
-        int beta = 0;
-        cublasStatus_t status = cublasGemmEx(cublas_handle_,
-                     CUBLAS_OP_N, CUBLAS_OP_N,
-                     n_pad, m_pad, k_pad,
-                     &alpha,
-                     d_scheme_ii_B_mod + p_idx * k_pad * n_pad, CUDA_R_8I, n_pad,
-                     d_scheme_ii_A_mod + p_idx * m_pad * k_pad, CUDA_R_8I, k_pad,
-                     &beta,
-                     d_scheme_ii_C_mod + p_idx * m_pad * n_pad, CUDA_R_32I, n_pad,
-                     CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < k; ++c) {
+            uint64_t words[3];
+            bool is_neg = false;
+            dd_to_words(h_A[r * k + c], s_A, words, &is_neg);
+            for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+                A_mod[p_idx * a_stride + r * k_pad + c] =
+                    words_to_res(words, MODULI_INT8_EXTENDED[p_idx], is_neg);
+            }
+        }
+    }
+    for (int r = 0; r < k; ++r) {
+        for (int c = 0; c < n; ++c) {
+            uint64_t words[3];
+            bool is_neg = false;
+            dd_to_words(h_B[r * n + c], s_B, words, &is_neg);
+            for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+                B_mod[p_idx * b_stride + r * n_pad + c] =
+                    words_to_res(words, MODULI_INT8_EXTENDED[p_idx], is_neg);
+            }
+        }
+    }
+    const auto t_ser1 = std::chrono::steady_clock::now();
+
+    cudaMemcpy(d_scheme_ii_A_mod, A_mod.data(), A_mod.size() * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_scheme_ii_B_mod, B_mod.data(), B_mod.size() * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+    int alpha = 1;
+    int beta = 0;
+    const auto t_g0 = std::chrono::steady_clock::now();
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        cublasStatus_t status = cublasGemmEx(
+            cublas_handle_,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n_pad, m_pad, k_pad,
+            &alpha,
+            d_scheme_ii_B_mod + p_idx * b_stride, CUDA_R_8I, n_pad,
+            d_scheme_ii_A_mod + p_idx * a_stride, CUDA_R_8I, k_pad,
+            &beta,
+            d_scheme_ii_C_mod + p_idx * c_stride, CUDA_R_32I, n_pad,
+            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         if (status != CUBLAS_STATUS_SUCCESS) {
             std::cerr << "cuBLAS GEMM failed with status: " << status << " for p_idx: " << p_idx << std::endl;
         }
-                     
-        cudaMemcpy(C_mod[p_idx].data(), d_scheme_ii_C_mod + p_idx * m_pad * n_pad, m_pad * n_pad * sizeof(int32_t), cudaMemcpyDeviceToHost);
     }
+    cudaDeviceSynchronize();
+    const auto t_g1 = std::chrono::steady_clock::now();
+
+    std::vector<int32_t> C_mod((size_t)num_moduli * c_stride, 0);
+    cudaMemcpy(C_mod.data(), d_scheme_ii_C_mod, C_mod.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    const auto t_crt0 = std::chrono::steady_clock::now();
     
     std::vector<int32_t> residues(num_moduli);
     std::vector<DoubleDouble> h_C(m * n);
@@ -1673,7 +1689,7 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
             UInt384 res(0);
             for (int p = 0; p < num_moduli; ++p) {
                 int prime = MODULI_INT8_EXTENDED[p];
-                long long target_mod = (long long)C_mod[p][r * n_pad + c];
+                long long target_mod = (long long)C_mod[p * c_stride + r * n_pad + c];
                 
                 target_mod = target_mod % prime;
                 if (target_mod < 0) target_mod += prime;
@@ -1763,6 +1779,14 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
         h_C[i] = val;
     }
     }
+    const auto t_crt1 = std::chrono::steady_clock::now();
+    auto stage_ms = [](std::chrono::steady_clock::time_point a,
+                       std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    current_contract_.stages.push_back({"dd_serialize", stage_ms(t_ser0, t_ser1), 0});
+    current_contract_.stages.push_back({"dd_gemm", stage_ms(t_g0, t_g1), 0});
+    current_contract_.stages.push_back({"dd_crt", stage_ms(t_crt0, t_crt1), 0});
     
     cudaMemcpy(dC, h_C.data(), m * n * sizeof(DoubleDouble), cudaMemcpyHostToDevice);
 }
