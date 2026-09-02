@@ -239,6 +239,14 @@ add_test(NAME dd_gemm COMMAND adaptive_gemm_dd_test)
 add_executable(adaptive_gemm_dd_error_128_test tests/dd_error_128_test.cpp)
 target_link_libraries(adaptive_gemm_dd_error_128_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
 add_test(NAME dd_error_128 COMMAND adaptive_gemm_dd_error_128_test)
+
+add_executable(adaptive_gemm_fp128_test tests/fp128_gemm_test.cpp)
+target_link_libraries(adaptive_gemm_fp128_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
+add_test(NAME fp128_gemm COMMAND adaptive_gemm_fp128_test)
+
+add_executable(adaptive_gemm_fp128_error_128_test tests/fp128_error_128_test.cpp)
+target_link_libraries(adaptive_gemm_fp128_error_128_test PRIVATE adaptive_gemm CUDA::cublas CUDA::cudart)
+add_test(NAME fp128_error_128 COMMAND adaptive_gemm_fp128_error_128_test)
 if(ADAPTIVEGEMM_BUILD_PYTHON)
     add_test(NAME pytest_binding
         COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py

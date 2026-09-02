@@ -109,8 +109,10 @@ namespace ozaki {
 static int scheme_ii_choose_num_moduli(int k, int target_bits, int requested, PrecisionPolicy policy, const std::string& input_type = "FP64") {
     int nmod = requested;
     if (policy == PrecisionPolicy::Auto || requested <= 0) {
-        int input_bits = (input_type == "DoubleDouble") ? 106 : target_bits;
-        int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+        int input_bits = target_bits;
+        if (input_type == "FP128") input_bits = 113;
+        else if (input_type == "DoubleDouble") input_bits = 106;
+        int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1))) + 1;
         double log2_prod = 0.0;
         nmod = MAX_MODULI_INT8;
         for (int i = 0; i < MAX_MODULI_INT8; ++i) {
@@ -130,8 +132,10 @@ static bool scheme_ii_condition_B(int num_moduli, int k, int target_bits, const 
     for (int i = 0; i < num_moduli && i < MAX_MODULI_INT8; ++i) {
         log2_prod += std::log2((double)MODULI_INT8_EXTENDED[i]);
     }
-    int input_bits = (input_type == "DoubleDouble") ? 106 : target_bits;
-    int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+    int input_bits = target_bits;
+    if (input_type == "FP128") input_bits = 113;
+    else if (input_type == "DoubleDouble") input_bits = 106;
+    int required_crt_bits = input_bits * 2 + (int)std::ceil(std::log2((double)std::max(k, 1))) + 1;
     return log2_prod < required_crt_bits;
 }
 
@@ -1482,7 +1486,7 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
     
     int num_moduli = scheme_ii_choose_num_moduli(k, 106, config_.scheme_ii_num_moduli, config_.precision_policy, "DoubleDouble");
     current_contract_.num_moduli = num_moduli;
-    current_contract_.required_crt_bits = 2 * 106 + (int)std::ceil(std::log2((double)std::max(k, 1)));
+    current_contract_.required_crt_bits = 2 * 106 + (int)std::ceil(std::log2((double)std::max(k, 1))) + 1;
     
     double log2_prod = 0.0;
     for (int i = 0; i < num_moduli; ++i) {
@@ -1789,6 +1793,161 @@ void AdaptiveOzakiEngine::execute(const DoubleDouble* dA, const DoubleDouble* dB
     current_contract_.stages.push_back({"dd_crt", stage_ms(t_crt0, t_crt1), 0});
     
     cudaMemcpy(dC, h_C.data(), m * n * sizeof(DoubleDouble), cudaMemcpyHostToDevice);
+}
+
+void AdaptiveOzakiEngine::execute(const Float128* dA, const Float128* dB, Float128* dC, const GEMMInput& input) {
+    if (input.op_A != "N" || input.op_B != "N") {
+        current_contract_.failure_reason = "Transpose not supported yet";
+        return;
+    }
+    if (input.beta != 0.0) {
+        current_contract_.failure_reason = "Non-zero beta not supported yet";
+        return;
+    }
+    execute(dA, dB, dC, input.M, input.N, input.K);
+}
+
+void AdaptiveOzakiEngine::execute(const Float128* dA, const Float128* dB, Float128* dC, int m, int n, int k) {
+    current_contract_.mode = "SchemeII";
+    current_contract_.input_type = "FP128";
+    current_contract_.target_mantissa_bits = 113;
+    current_contract_.native_fp64_used = false;
+    current_contract_.residual_enabled = false;
+    current_contract_.residual_used = false;
+    current_contract_.fallback_mode = "None";
+    current_contract_.failure_reason = "";
+
+    int num_moduli = scheme_ii_choose_num_moduli(k, 113, config_.scheme_ii_num_moduli, config_.precision_policy, "FP128");
+    current_contract_.num_moduli = num_moduli;
+    current_contract_.required_crt_bits = 2 * 113 + (int)std::ceil(std::log2((double)std::max(k, 1))) + 1;
+    double log2_prod = 0.0;
+    for (int i = 0; i < num_moduli; ++i) {
+        log2_prod += std::log2((double)MODULI_INT8_EXTENDED[i]);
+    }
+    current_contract_.crt_bits = (int)log2_prod;
+    if (log2_prod < current_contract_.required_crt_bits) {
+        current_contract_.failure_reason = "Insufficient CRT bits for FP128";
+        throw std::runtime_error("Insufficient CRT bits for FP128");
+    }
+    if (current_contract_.required_crt_bits > 384) {
+        current_contract_.failure_reason = "Insufficient integer width";
+        throw std::runtime_error("Insufficient integer width");
+    }
+
+    std::vector<Float128> h_A(m * k);
+    std::vector<Float128> h_B(k * n);
+    cudaMemcpy(h_A.data(), dA, m * k * sizeof(Float128), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_B.data(), dB, k * n * sizeof(Float128), cudaMemcpyDeviceToHost);
+
+    int max_log = -1024;
+    for (int i = 0; i < m * k; ++i) max_log = std::max(max_log, h_A[i].log2_floor());
+    for (int i = 0; i < k * n; ++i) max_log = std::max(max_log, h_B[i].log2_floor());
+    int s_A = 113 - max_log;
+    int s_B = 113 - max_log;
+
+    int m_pad = ((m + 127) / 128) * 128;
+    int n_pad = ((n + 127) / 128) * 128;
+    int k_pad = ((k + 63) / 64) * 64;
+    const size_t a_stride = (size_t)m_pad * k_pad;
+    const size_t b_stride = (size_t)k_pad * n_pad;
+    const size_t c_stride = (size_t)m_pad * n_pad;
+    std::vector<int8_t> A_mod((size_t)num_moduli * a_stride, 0);
+    std::vector<int8_t> B_mod((size_t)num_moduli * b_stride, 0);
+
+    auto to_res = [](const UInt384& mag, bool neg, int prime) -> int8_t {
+        long long rem = (long long)(mag % (uint32_t)prime);
+        if (neg && rem != 0) rem = (long long)prime - rem;
+        if (rem > prime / 2) rem -= prime;
+        return (int8_t)rem;
+    };
+
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < k; ++c) {
+            UInt384 mag;
+            bool neg = false;
+            h_A[r * k + c].to_scaled(&mag, &neg, s_A);
+            for (int p = 0; p < num_moduli; ++p) {
+                A_mod[p * a_stride + r * k_pad + c] = to_res(mag, neg, MODULI_INT8_EXTENDED[p]);
+            }
+        }
+    }
+    for (int r = 0; r < k; ++r) {
+        for (int c = 0; c < n; ++c) {
+            UInt384 mag;
+            bool neg = false;
+            h_B[r * n + c].to_scaled(&mag, &neg, s_B);
+            for (int p = 0; p < num_moduli; ++p) {
+                B_mod[p * b_stride + r * n_pad + c] = to_res(mag, neg, MODULI_INT8_EXTENDED[p]);
+            }
+        }
+    }
+
+    cudaMemcpy(d_scheme_ii_A_mod, A_mod.data(), A_mod.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_scheme_ii_B_mod, B_mod.data(), B_mod.size(), cudaMemcpyHostToDevice);
+
+    int alpha = 1, beta = 0;
+    for (int p_idx = 0; p_idx < num_moduli; ++p_idx) {
+        cublasGemmEx(cublas_handle_, CUBLAS_OP_N, CUBLAS_OP_N,
+                     n_pad, m_pad, k_pad, &alpha,
+                     d_scheme_ii_B_mod + p_idx * b_stride, CUDA_R_8I, n_pad,
+                     d_scheme_ii_A_mod + p_idx * a_stride, CUDA_R_8I, k_pad,
+                     &beta,
+                     d_scheme_ii_C_mod + p_idx * c_stride, CUDA_R_32I, n_pad,
+                     CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+    cudaDeviceSynchronize();
+
+    std::vector<int32_t> C_mod((size_t)num_moduli * c_stride, 0);
+    cudaMemcpy(C_mod.data(), d_scheme_ii_C_mod, C_mod.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+    UInt384 M_total(1);
+    for (int p = 0; p < num_moduli; ++p) M_total = M_total * (uint32_t)MODULI_INT8_EXTENDED[p];
+    std::vector<UInt384> M_i(num_moduli);
+    std::vector<uint32_t> M_i_inv(num_moduli);
+    auto modInverse = [](uint32_t a, uint32_t m) -> uint32_t {
+        int32_t m0 = (int32_t)m, t, q;
+        int32_t x0 = 0, x1 = 1;
+        if (m == 1) return 0;
+        while (a > 1) {
+            q = (int32_t)(a / (uint32_t)m);
+            t = (int32_t)m;
+            m = a % m;
+            a = (uint32_t)t;
+            t = x0;
+            x0 = x1 - q * x0;
+            x1 = t;
+        }
+        if (x1 < 0) x1 += m0;
+        return (uint32_t)x1;
+    };
+    for (int p = 0; p < num_moduli; ++p) {
+        UInt384 mi(1);
+        for (int j = 0; j < num_moduli; ++j) if (p != j) mi = mi * (uint32_t)MODULI_INT8_EXTENDED[j];
+        M_i[p] = mi;
+        M_i_inv[p] = modInverse(mi % (uint32_t)MODULI_INT8_EXTENDED[p], (uint32_t)MODULI_INT8_EXTENDED[p]);
+    }
+    UInt384 half_M = M_total >> 1;
+    std::vector<Float128> h_C(m * n);
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < n; ++c) {
+            UInt384 res(0);
+            for (int p = 0; p < num_moduli; ++p) {
+                int prime = MODULI_INT8_EXTENDED[p];
+                long long target_mod = (long long)C_mod[p * c_stride + r * n_pad + c];
+                target_mod %= prime;
+                if (target_mod < 0) target_mod += prime;
+                uint32_t term = (uint32_t)(((uint64_t)target_mod * M_i_inv[p]) % (uint32_t)prime);
+                res = res + (M_i[p] * term);
+            }
+            for (int j = 0; j < num_moduli; ++j) {
+                if (!(res < M_total)) res = res - M_total;
+            }
+            bool is_neg = !(res < half_M);
+            UInt384 abs_res = is_neg ? (M_total - res) : res;
+            h_C[r * n + c] = Float128::from_scaled(abs_res, is_neg, s_A + s_B);
+        }
+    }
+    cudaMemcpy(dC, h_C.data(), m * n * sizeof(Float128), cudaMemcpyHostToDevice);
 }
 
 void AdaptiveOzakiEngine::execute(const double* dA, const double* dB, double* dC, const GEMMInput& input) {

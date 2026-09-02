@@ -23,6 +23,44 @@ struct UInt384 {
         for (int i=1; i<6; ++i) words[i] = 0;
     }
 
+    UInt384(uint64_t lo, uint64_t hi) {
+        words[0] = lo;
+        words[1] = hi;
+        for (int i = 2; i < 6; ++i) words[i] = 0;
+    }
+
+    int bit_length() const {
+        for (int i = 5; i >= 0; --i) {
+            if (words[i] == 0) continue;
+            uint64_t w = words[i];
+            int b = 63;
+            while (b > 0 && (w >> b) == 0) --b;
+            return 64 * i + b + 1;
+        }
+        return 0;
+    }
+
+    int get_bit(int idx) const {
+        if (idx < 0 || idx >= 384) return 0;
+        return (int)((words[idx / 64] >> (idx % 64)) & 1ull);
+    }
+
+    UInt384 operator<<(int shift) const {
+        if (shift == 0) return *this;
+        if (shift >= 384) return UInt384();
+        if (shift < 0) return (*this) >> (-shift);
+        UInt384 res;
+        int word_shift = shift / 64;
+        int bit_shift = shift % 64;
+        for (int i = 5; i >= word_shift; --i) {
+            res.words[i] = words[i - word_shift] << bit_shift;
+            if (bit_shift > 0 && i - word_shift - 1 >= 0) {
+                res.words[i] |= (words[i - word_shift - 1] >> (64 - bit_shift));
+            }
+        }
+        return res;
+    }
+
     // Add another UInt384
     UInt384 operator+(const UInt384& other) const {
         UInt384 res;

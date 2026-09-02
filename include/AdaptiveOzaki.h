@@ -1,5 +1,6 @@
 #include "scheme_ii_int192.h"
 #include "DoubleDouble.h"
+#include "Float128.h"
 #pragma once
 
 #include <cuda_runtime.h>
@@ -158,6 +159,8 @@ public:
     void execute(const double* d_A, const double* d_B, double* d_C, const GEMMInput& input);
     void execute(const DoubleDouble* d_A, const DoubleDouble* d_B, DoubleDouble* d_C, int m, int n, int k);
     void execute(const DoubleDouble* d_A, const DoubleDouble* d_B, DoubleDouble* d_C, const GEMMInput& input);
+    void execute(const Float128* d_A, const Float128* d_B, Float128* d_C, int m, int n, int k);
+    void execute(const Float128* d_A, const Float128* d_B, Float128* d_C, const GEMMInput& input);
 
     // Workspace management
     void allocateWorkspace(int m, int n, int k);
