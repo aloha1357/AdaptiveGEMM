@@ -3,8 +3,14 @@
 #include "UInt384.h"
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ozaki {
+
+struct IeeeBinary128Bits {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+};
 
 // 113-bit significand M in [2^112, 2^113) when normalized.
 // |value| = M * 2^expo.
@@ -14,9 +20,90 @@ struct Float128 {
     int32_t expo = 0;
     int32_t sign = 0; // 0 +, 1 -
 
+    static constexpr int kIeeeExponentBias = 16383;
+    static constexpr int kIeeeMinNormalExponent = -16382;
+    static constexpr int kIeeeFractionBits = 112;
+    static constexpr uint64_t kIeeeFractionHiMask = (1ull << 48) - 1ull;
+    static constexpr uint16_t kIeeeInfNanExponent = 0x7fff;
+
     static Float128 zero() { return {}; }
 
     bool is_zero() const { return mant_lo == 0 && (mant_hi == 0); }
+
+    static Float128 from_ieee_binary128(uint64_t hi_bits, uint64_t lo_bits) {
+        Float128 r;
+        r.sign = (hi_bits >> 63) ? 1 : 0;
+
+        uint16_t exp_field = (uint16_t)((hi_bits >> 48) & 0x7fffull);
+        uint64_t frac_hi = hi_bits & kIeeeFractionHiMask;
+        uint64_t frac_lo = lo_bits;
+
+        if (exp_field == kIeeeInfNanExponent) {
+            throw std::invalid_argument("Float128 finite adapter does not support IEEE binary128 NaN/Inf");
+        }
+
+        if (exp_field == 0) {
+            UInt384 frac(frac_lo, frac_hi);
+            int B = frac.bit_length();
+            if (B == 0) return zero();
+
+            int shift = kIeeeFractionBits + 1 - B;
+            UInt384 m = frac << shift;
+            r.mant_lo = m.words[0];
+            r.mant_hi = m.words[1];
+            r.expo = (1 - kIeeeExponentBias - kIeeeFractionBits) - shift;
+            r.normalize();
+            return r;
+        }
+
+        r.mant_lo = frac_lo;
+        r.mant_hi = (1ull << 48) | frac_hi;
+        r.expo = (int)exp_field - kIeeeExponentBias - kIeeeFractionBits;
+        r.normalize();
+        return r;
+    }
+
+    static Float128 from_ieee_binary128_bits(const IeeeBinary128Bits& bits) {
+        return from_ieee_binary128(bits.hi, bits.lo);
+    }
+
+    IeeeBinary128Bits to_ieee_binary128_bits() const {
+        Float128 x = *this;
+        x.normalize();
+
+        IeeeBinary128Bits out;
+        uint64_t sign_bit = x.sign ? (1ull << 63) : 0ull;
+        if (x.is_zero()) {
+            out.hi = sign_bit;
+            out.lo = 0;
+            return out;
+        }
+
+        int E = x.expo + kIeeeFractionBits;
+        if (E >= kIeeeMinNormalExponent) {
+            int exp_field = E + kIeeeExponentBias;
+            if (exp_field >= kIeeeInfNanExponent) {
+                throw std::overflow_error("Float128 value is too large for finite IEEE binary128");
+            }
+            out.hi = sign_bit | ((uint64_t)exp_field << 48) | (x.mant_hi & kIeeeFractionHiMask);
+            out.lo = x.mant_lo;
+            return out;
+        }
+
+        UInt384 m(x.mant_lo, x.mant_hi);
+        int shift = (1 - kIeeeExponentBias - kIeeeFractionBits) - x.expo;
+        UInt384 frac = shift_right_round_to_even(m, shift);
+
+        if (frac.bit_length() > kIeeeFractionBits) {
+            out.hi = sign_bit | (1ull << 48);
+            out.lo = 0;
+            return out;
+        }
+
+        out.hi = sign_bit | (frac.words[1] & kIeeeFractionHiMask);
+        out.lo = frac.words[0];
+        return out;
+    }
 
     static Float128 from_double(double x) {
         Float128 r;
@@ -170,6 +257,38 @@ private:
         if (a.expo != b.expo) return a.expo > b.expo;
         if (a.mant_hi != b.mant_hi) return a.mant_hi > b.mant_hi;
         return a.mant_lo >= b.mant_lo;
+    }
+
+    static bool any_bits_below(const UInt384& v, int bit_count) {
+        if (bit_count <= 0) return false;
+        if (bit_count >= 384) {
+            for (int i = 0; i < 6; ++i) {
+                if (v.words[i] != 0) return true;
+            }
+            return false;
+        }
+
+        int full_words = bit_count / 64;
+        int rem_bits = bit_count % 64;
+        for (int i = 0; i < full_words; ++i) {
+            if (v.words[i] != 0) return true;
+        }
+        if (rem_bits == 0) return false;
+        uint64_t mask = (1ull << rem_bits) - 1ull;
+        return (v.words[full_words] & mask) != 0;
+    }
+
+    static UInt384 shift_right_round_to_even(const UInt384& v, int shift) {
+        if (shift <= 0) return v << (-shift);
+
+        UInt384 truncated = v >> shift;
+        bool guard = (shift - 1 < 384) && v.get_bit(shift - 1);
+        bool sticky = any_bits_below(v, shift - 1);
+        bool lsb_odd = truncated.get_bit(0) != 0;
+        if (guard && (sticky || lsb_odd)) {
+            truncated = truncated + 1u;
+        }
+        return truncated;
     }
 
     void normalize() {
