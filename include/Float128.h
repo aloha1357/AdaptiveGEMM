@@ -3,6 +3,7 @@
 #include "UInt384.h"
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ozaki {
@@ -12,6 +13,13 @@ struct IeeeBinary128Bits {
     uint64_t lo = 0;
 };
 
+enum class Float128Class : uint32_t {
+    Zero = 0,
+    Finite = 1,
+    Infinite = 2,
+    NaN = 3
+};
+
 // 113-bit significand M in [2^112, 2^113) when normalized.
 // |value| = M * 2^expo.
 struct Float128 {
@@ -19,6 +27,7 @@ struct Float128 {
     uint64_t mant_hi = 0; // M bits 64-112
     int32_t expo = 0;
     int32_t sign = 0; // 0 +, 1 -
+    Float128Class fpclass = Float128Class::Zero;
 
     static constexpr int kIeeeExponentBias = 16383;
     static constexpr int kIeeeMinNormalExponent = -16382;
@@ -26,9 +35,32 @@ struct Float128 {
     static constexpr uint64_t kIeeeFractionHiMask = (1ull << 48) - 1ull;
     static constexpr uint16_t kIeeeInfNanExponent = 0x7fff;
 
-    static Float128 zero() { return {}; }
+    static Float128 zero(int sign_bit = 0) {
+        Float128 r;
+        r.sign = sign_bit ? 1 : 0;
+        r.fpclass = Float128Class::Zero;
+        return r;
+    }
 
-    bool is_zero() const { return mant_lo == 0 && (mant_hi == 0); }
+    static Float128 infinity(int sign_bit = 0) {
+        Float128 r;
+        r.sign = sign_bit ? 1 : 0;
+        r.fpclass = Float128Class::Infinite;
+        return r;
+    }
+
+    static Float128 quiet_nan(int sign_bit = 0) {
+        Float128 r;
+        r.sign = sign_bit ? 1 : 0;
+        r.mant_hi = 1ull << 47;
+        r.fpclass = Float128Class::NaN;
+        return r;
+    }
+
+    bool is_zero() const { return fpclass == Float128Class::Zero; }
+    bool is_finite() const { return fpclass == Float128Class::Zero || fpclass == Float128Class::Finite; }
+    bool is_inf() const { return fpclass == Float128Class::Infinite; }
+    bool is_nan() const { return fpclass == Float128Class::NaN; }
 
     static Float128 from_ieee_binary128(uint64_t hi_bits, uint64_t lo_bits) {
         Float128 r;
@@ -39,19 +71,25 @@ struct Float128 {
         uint64_t frac_lo = lo_bits;
 
         if (exp_field == kIeeeInfNanExponent) {
-            throw std::invalid_argument("Float128 finite adapter does not support IEEE binary128 NaN/Inf");
+            if ((frac_hi | frac_lo) == 0) return infinity(r.sign);
+            r.mant_lo = frac_lo;
+            r.mant_hi = frac_hi;
+            r.expo = 0;
+            r.fpclass = Float128Class::NaN;
+            return r;
         }
 
         if (exp_field == 0) {
             UInt384 frac(frac_lo, frac_hi);
             int B = frac.bit_length();
-            if (B == 0) return zero();
+            if (B == 0) return zero(r.sign);
 
             int shift = kIeeeFractionBits + 1 - B;
             UInt384 m = frac << shift;
             r.mant_lo = m.words[0];
             r.mant_hi = m.words[1];
             r.expo = (1 - kIeeeExponentBias - kIeeeFractionBits) - shift;
+            r.fpclass = Float128Class::Finite;
             r.normalize();
             return r;
         }
@@ -59,6 +97,7 @@ struct Float128 {
         r.mant_lo = frac_lo;
         r.mant_hi = (1ull << 48) | frac_hi;
         r.expo = (int)exp_field - kIeeeExponentBias - kIeeeFractionBits;
+        r.fpclass = Float128Class::Finite;
         r.normalize();
         return r;
     }
@@ -73,6 +112,19 @@ struct Float128 {
 
         IeeeBinary128Bits out;
         uint64_t sign_bit = x.sign ? (1ull << 63) : 0ull;
+        if (x.is_nan()) {
+            uint64_t payload_hi = x.mant_hi & kIeeeFractionHiMask;
+            uint64_t payload_lo = x.mant_lo;
+            if ((payload_hi | payload_lo) == 0) payload_hi = 1ull << 47;
+            out.hi = sign_bit | ((uint64_t)kIeeeInfNanExponent << 48) | payload_hi;
+            out.lo = payload_lo;
+            return out;
+        }
+        if (x.is_inf()) {
+            out.hi = sign_bit | ((uint64_t)kIeeeInfNanExponent << 48);
+            out.lo = 0;
+            return out;
+        }
         if (x.is_zero()) {
             out.hi = sign_bit;
             out.lo = 0;
@@ -107,8 +159,11 @@ struct Float128 {
 
     static Float128 from_double(double x) {
         Float128 r;
-        if (x == 0.0 || !std::isfinite(x)) return r;
-        r.sign = x < 0.0 ? 1 : 0;
+        if (std::isnan(x)) return quiet_nan(std::signbit(x) ? 1 : 0);
+        if (std::isinf(x)) return infinity(std::signbit(x) ? 1 : 0);
+        if (x == 0.0) return zero(std::signbit(x) ? 1 : 0);
+        r.sign = std::signbit(x) ? 1 : 0;
+        r.fpclass = Float128Class::Finite;
         int e = 0;
         double f = std::frexp(std::fabs(x), &e); // [0.5, 1)
         // 53-bit mantissa of f, then pad 60 zero bits to 113.
@@ -126,6 +181,7 @@ struct Float128 {
     static Float128 from_pow2(int e) {
         Float128 r;
         r.sign = 0;
+        r.fpclass = Float128Class::Finite;
         r.mant_lo = 0;
         r.mant_hi = (1ull << 48); // bit 112 = bit 48 of hi
         r.expo = e - 112;
@@ -137,12 +193,18 @@ struct Float128 {
     }
 
     int log2_floor() const {
+        if (!is_finite()) {
+            throw std::domain_error("Float128 non-finite value has no finite log2_floor");
+        }
         if (is_zero()) return -1024;
         return expo + 112;
     }
 
     double to_double() const {
-        if (is_zero()) return 0.0;
+        if (is_nan()) return std::numeric_limits<double>::quiet_NaN();
+        if (is_inf()) return sign ? -std::numeric_limits<double>::infinity()
+                                  : std::numeric_limits<double>::infinity();
+        if (is_zero()) return sign ? -0.0 : 0.0;
         // M / 2^112 * 2^(expo+112) = (M/2^112) * 2^log2_floor
         double hi = (double)mant_hi * 18446744073709551616.0 + (double)mant_lo;
         double v = std::ldexp(hi, expo);
@@ -150,9 +212,13 @@ struct Float128 {
     }
 
     void to_scaled(UInt384* mag, bool* neg, int scale) const {
+        if (!is_finite()) {
+            throw std::domain_error("Float128 CRT scaling supports finite values only");
+        }
         *neg = sign != 0;
         if (is_zero()) {
             *mag = UInt384();
+            *neg = false;
             return;
         }
         UInt384 m(mant_lo, mant_hi);
@@ -172,6 +238,7 @@ struct Float128 {
         int B = mag.bit_length();
         if (B == 0) return r;
         r.sign = neg ? 1 : 0;
+        r.fpclass = Float128Class::Finite;
         int need = B - 113;
         UInt384 m113;
         if (need >= 0) {
@@ -190,6 +257,11 @@ struct Float128 {
     }
 
     Float128 operator+(const Float128& o) const {
+        if (is_nan() || o.is_nan()) return quiet_nan();
+        if (is_inf() || o.is_inf()) {
+            if (is_inf() && o.is_inf() && sign != o.sign) return quiet_nan();
+            return is_inf() ? *this : o;
+        }
         if (is_zero()) return o;
         if (o.is_zero()) return *this;
         const Float128* a = this;
@@ -207,6 +279,7 @@ struct Float128 {
         shr_limbs(B, d);
         Float128 r;
         r.expo = a->expo;
+        r.fpclass = Float128Class::Finite;
         if (a->sign == b->sign) {
             add_limbs(A, B);
             r.sign = a->sign;
@@ -222,7 +295,10 @@ struct Float128 {
     }
 
     Float128 operator*(const Float128& o) const {
-        if (is_zero() || o.is_zero()) return zero();
+        if (is_nan() || o.is_nan()) return quiet_nan();
+        if ((is_inf() && o.is_zero()) || (is_zero() && o.is_inf())) return quiet_nan();
+        if (is_inf() || o.is_inf()) return infinity(sign ^ o.sign);
+        if (is_zero() || o.is_zero()) return zero(sign ^ o.sign);
         uint32_t A[4], B[4], P[8];
         split_limbs4(*this, A);
         split_limbs4(o, B);
@@ -292,17 +368,34 @@ private:
     }
 
     void normalize() {
+        if (is_nan()) {
+            expo = 0;
+            if ((mant_hi & kIeeeFractionHiMask) == 0 && mant_lo == 0) mant_hi = 1ull << 47;
+            mant_hi &= kIeeeFractionHiMask;
+            return;
+        }
+        if (is_inf()) {
+            expo = 0;
+            mant_lo = 0;
+            mant_hi = 0;
+            return;
+        }
+        if (fpclass != Float128Class::Finite && !is_zero()) {
+            fpclass = Float128Class::Finite;
+        }
         if (is_zero()) {
             expo = 0;
-            sign = 0;
+            mant_lo = 0;
+            mant_hi = 0;
             return;
         }
         UInt384 m(mant_lo, mant_hi);
         int B = m.bit_length();
         if (B == 0) {
-            *this = zero();
+            *this = zero(sign);
             return;
         }
+        fpclass = Float128Class::Finite;
         int need = B - 113;
         if (need > 0) {
             int round_bit = m.get_bit(need - 1);

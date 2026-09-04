@@ -7,6 +7,7 @@
 
 using ozaki::Float128;
 using ozaki::IeeeBinary128Bits;
+using ozaki::UInt384;
 
 static void expect_bits_eq(IeeeBinary128Bits actual, uint64_t hi, uint64_t lo) {
     assert(actual.hi == hi);
@@ -17,15 +18,6 @@ static void expect_roundtrip(uint64_t hi, uint64_t lo) {
     Float128 x = Float128::from_ieee_binary128(hi, lo);
     IeeeBinary128Bits y = x.to_ieee_binary128_bits();
     expect_bits_eq(y, hi, lo);
-}
-
-static bool decode_throws(uint64_t hi, uint64_t lo) {
-    try {
-        (void)Float128::from_ieee_binary128(hi, lo);
-    } catch (const std::invalid_argument&) {
-        return true;
-    }
-    return false;
 }
 
 int main() {
@@ -50,13 +42,27 @@ int main() {
     expect_roundtrip(0x0000ffffffffffffull, 0xffffffffffffffffull); // max subnormal
     expect_roundtrip(0x0000000000000000ull, 0x0000000000000001ull); // min subnormal
 
-    // Positive zero round-trips. Current Float128 value semantics do not preserve -0.
+    // Signed zero round-trips at the adapter boundary.
     expect_roundtrip(0x0000000000000000ull, 0x0000000000000000ull);
+    expect_roundtrip(0x8000000000000000ull, 0x0000000000000000ull);
 
-    // GEMM Float128 is finite-only; NaN/Inf are rejected at the adapter boundary.
-    assert(decode_throws(0x7fff000000000000ull, 0x0000000000000000ull)); // +inf
-    assert(decode_throws(0xffff000000000000ull, 0x0000000000000000ull)); // -inf
-    assert(decode_throws(0x7fff800000000000ull, 0x0000000000000000ull)); // qNaN
+    // Special IEEE values round-trip as bit patterns. CRT GEMM still rejects
+    // these later because NaN/Inf have no residue representation.
+    expect_roundtrip(0x7fff000000000000ull, 0x0000000000000000ull); // +inf
+    expect_roundtrip(0xffff000000000000ull, 0x0000000000000000ull); // -inf
+    expect_roundtrip(0x7fff800000000000ull, 0x0000000000000000ull); // qNaN
+    expect_roundtrip(0x7fff000000000001ull, 0x123456789abcdef0ull); // sNaN payload
+    expect_roundtrip(0xffff800000000001ull, 0x0000000000000001ull); // negative qNaN payload
+
+    bool nonfinite_rejected_by_crt = false;
+    try {
+        UInt384 mag;
+        bool neg = false;
+        Float128::infinity().to_scaled(&mag, &neg, 0);
+    } catch (const std::domain_error&) {
+        nonfinite_rejected_by_crt = true;
+    }
+    assert(nonfinite_rejected_by_crt);
 
     std::cout << "fp128_ieee_adapter_test passed\n";
     return 0;
