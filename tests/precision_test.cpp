@@ -11,6 +11,12 @@
 
 using namespace ozaki;
 
+#if defined(CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT) && defined(CUDA_EMULATION_MANTISSA_CONTROL_FIXED)
+#define ADAPTIVEGEMM_HAS_FP64_EMULATION 1
+#else
+#define ADAPTIVEGEMM_HAS_FP64_EMULATION 0
+#endif
+
 #define CHECK_CUDA(call) do { cudaError_t err = call; if (err != cudaSuccess) { std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; std::exit(1); } } while (0)
 #define CHECK_CUBLAS(call) do { cublasStatus_t err = call; if (err != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ << std::endl; std::exit(1); } } while (0)
 
@@ -210,6 +216,7 @@ int main(int argc, char** argv) {
 
     if (enable_benchmark) {
         cublasHandle_t handle_emu;
+#if ADAPTIVEGEMM_HAS_FP64_EMULATION
         CHECK_CUBLAS(cublasCreate(&handle_emu));
 
         cudaEventRecord(start_fp64);
@@ -237,6 +244,10 @@ int main(int argc, char** argv) {
         cudaEventElapsedTime(&fix_emu_ms, start_fp64, stop_fp64);
         fix_emu_ms /= (float)std::max(repeat, 1);
         cublasDestroy(handle_emu);
+#else
+        dyn_emu_ms = -1.0f;
+        fix_emu_ms = -1.0f;
+#endif
 
         OzakiConfig cfg_ii = config;
         cfg_ii.mode = ExecutionMode::SchemeII;

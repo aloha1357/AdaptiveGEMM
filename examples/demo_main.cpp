@@ -18,6 +18,16 @@
 
 using namespace ozaki;
 
+#if defined(CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT) && \
+    defined(CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC) && \
+    defined(CUDA_EMULATION_MANTISSA_CONTROL_FIXED)
+#define ADAPTIVEGEMM_HAS_FP64_EMULATION 1
+#define ADAPTIVEGEMM_EMU_COMPUTE CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+#else
+#define ADAPTIVEGEMM_HAS_FP64_EMULATION 0
+#define ADAPTIVEGEMM_EMU_COMPUTE CUBLAS_COMPUTE_64F
+#endif
+
 #define CHECK_CUDA(call)                                                                      \
     do {                                                                                      \
         cudaError_t err = call;                                                               \
@@ -119,9 +129,11 @@ int main() {
     void* emu_ws = nullptr;
     CHECK_CUDA(cudaMalloc(&emu_ws, ws_bytes));
     CHECK_CUBLAS(cublasSetWorkspace(handle_emu, emu_ws, ws_bytes));
+#if ADAPTIVEGEMM_HAS_FP64_EMULATION
     CHECK_CUBLAS(cublasSetEmulationStrategy(handle_emu, CUBLAS_EMULATION_STRATEGY_EAGER));
     CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(
         handle_emu, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+#endif
 
     const double alpha = 1.0;
     const double beta = 0.0;
@@ -140,7 +152,7 @@ int main() {
 
     std::vector<double> h_C_emu(element_count, 0.0);
     const double emu_ms = time_ms(
-        runs, [&]() { cublas_rowmajor_ab(handle_emu, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT); });
+        runs, [&]() { cublas_rowmajor_ab(handle_emu, ADAPTIVEGEMM_EMU_COMPUTE); });
     CHECK_CUDA(cudaMemcpy(h_C_emu.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
 
     OzakiConfig config;
@@ -169,6 +181,7 @@ int main() {
     std::cout << "Phase22 vs cuBLAS emu:   " << (emu_ms / adaptive_ms) << "x ( >1 means Phase22 faster )\n";
 
     std::cout << "\ncuBLAS emu fixed mantissa (Phase 22 is ~34-bit Ozaki):\n";
+#if ADAPTIVEGEMM_HAS_FP64_EMULATION
     CHECK_CUBLAS(cublasSetFixedPointEmulationMantissaControl(
         handle_emu, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
     std::vector<double> h_bits(element_count);
@@ -176,7 +189,7 @@ int main() {
     for (int bits : bit_counts) {
         CHECK_CUBLAS(cublasSetFixedPointEmulationMaxMantissaBitCount(handle_emu, bits));
         const double ms = time_ms(
-            runs, [&]() { cublas_rowmajor_ab(handle_emu, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT); });
+            runs, [&]() { cublas_rowmajor_ab(handle_emu, ADAPTIVEGEMM_EMU_COMPUTE); });
         CHECK_CUDA(cudaMemcpy(h_bits.data(), d_C, element_count * sizeof(double),
                               cudaMemcpyDeviceToHost));
         const int slices = (bits + 1 + 7) / 8;
@@ -196,6 +209,9 @@ int main() {
         CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
         std::cout << "    [Scheme I] p=" << slices << " T=4: " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
     }
+#else
+    std::cout << "cuBLAS FP64 emulation API unavailable in this CUDA toolkit; skipped.\n";
+#endif
 
     double cpu = 0.0;
     for (int kk = 0; kk < n; ++kk) cpu += h_A[0 * n + kk] * h_B[kk * n + 0];
