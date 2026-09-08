@@ -192,17 +192,14 @@ __global__ void __launch_bounds__(256, MinBlocks) scheme_ii_grouped_mma_kernel(
         };
         auto load_b_smem = [&](int buf, int k_offset) {
             int8_t* sB = sB_ptr + buf * BN * 64;
-            for (int i = tid; i < BK * BN / 16; i += 256) {
-                int row = (i * 16) / BN;
-                int col = (i * 16) % BN;
-                int gk = k_offset + row;
-                int gn = bn_off + col;
-                int4 v = *(int4*)&B_g[(size_t)gk * n + gn];
-                int8_t* bytes = (int8_t*)&v;
-                #pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    sB[(col + j) * 64 + swizzle_B(col + j, row)] = bytes[j];
-                }
+            // B is N-major (K-contiguous): B[n, k]. Same 16B cp.async as A.
+            for (int i = tid; i < BN * BK / 16; i += 256) {
+                int row = (i * 16) / BK; // N
+                int col = (i * 16) % BK; // K
+                int gn = bn_off + row;
+                int gk = k_offset + col;
+                cp_async_16(&sB[row * 64 + swizzle_B(row, col)],
+                            &B_g[(size_t)gn * k + gk]);
             }
         };
         auto load_a_frag = [&](int buf, int k_step, int fbuf) {

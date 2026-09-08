@@ -1,4 +1,4 @@
-﻿#include "AdaptiveOzaki.h"
+#include "AdaptiveOzaki.h"
 #include "int8_gemm.h"
 
 #include <cublas_v2.h>
@@ -179,6 +179,18 @@ int main() {
         std::cout << "  mantissa " << bits << "  (~" << slices << " slices, " << (slices * slices)
                   << " GEMMs): " << ms << " ms  err " << max_error(h_C_reference, h_bits)
                   << "  vs Phase22 " << (adaptive_ms / ms) << "x ( >1 means emu faster )\n";
+
+        OzakiConfig cfg_scheme_i;
+        cfg_scheme_i.mode = ExecutionMode::SchemeI;
+        cfg_scheme_i.scheme_i_mantissa_bits = bits;
+        cfg_scheme_i.scheme_i_triangular = true;
+        cfg_scheme_i.scheme_i_pair_threshold = 4;
+        cfg_scheme_i.scheme_i_fused = false;
+        AdaptiveOzakiEngine engine_i(cfg_scheme_i);
+        std::vector<double> h_C_scheme_i(element_count, 0.0);
+        const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
+        CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+        std::cout << "    [Scheme I] p=" << slices << " T=4: " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
     }
 
     double cpu = 0.0;
@@ -223,27 +235,54 @@ int main() {
         cfg_scheme_i.scheme_i_mantissa_bits = 34;
         cfg_scheme_i.scheme_i_triangular = true;
         cfg_scheme_i.scheme_i_pair_threshold = 4;
-        cfg_scheme_i.scheme_i_use_cublas_int8 = true;
-        AdaptiveOzakiEngine engine_i(cfg_scheme_i);
-        std::vector<double> h_C_scheme_i(element_count, 0.0);
-        const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
-        CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
-        std::cout << "\n[SchemeI] bits=34 p=5 pairs=15 backend=cublas  total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
-        std::cout << "          (Note: B v0 uses 1760 MiB. 無 6.0 ms 閘)\n";
-    }    {
-        OzakiConfig cfg_scheme_i;
-        cfg_scheme_i.mode = ExecutionMode::SchemeI;
-        cfg_scheme_i.scheme_i_mantissa_bits = 34;
-        cfg_scheme_i.scheme_i_triangular = true;
-        cfg_scheme_i.scheme_i_pair_threshold = 4;
-        cfg_scheme_i.scheme_i_use_cublas_int8 = false;
+        // scheme_i_use_cublas_int8 = false by default (PR4b)
         cfg_scheme_i.scheme_i_fused = false;
         AdaptiveOzakiEngine engine_i(cfg_scheme_i);
         std::vector<double> h_C_scheme_i(element_count, 0.0);
         const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
         CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
-        std::cout << "[SchemeI] bits=34 p=5 pairs=15 backend=intree_f64_epilogue  total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
-        std::cout << "          (Note: B.1 估 1280 MiB；6.0 ms 是量測閘不是保證。)\n";
+        std::cout << "\n[SchemeI] bits=34 p=5 pairs=15 backend=intree_f64_epilogue  total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
+        std::cout << "          (B.1 in-tree INT8 GEMM + FP64 epilogue; est. 1280 MiB HBM)\n";
+        // -- backend=cublas 仍可強制：cfg_scheme_i.scheme_i_use_cublas_int8 = true;
+    }
+    {
+        OzakiConfig cfg_scheme_i;
+        cfg_scheme_i.mode = ExecutionMode::SchemeI;
+        cfg_scheme_i.scheme_i_mantissa_bits = 34;
+        cfg_scheme_i.scheme_i_triangular = true;
+        cfg_scheme_i.scheme_i_pair_threshold = 4;
+        cfg_scheme_i.scheme_i_use_cublas_int8 = true; // force cublas (B v0)
+        AdaptiveOzakiEngine engine_i(cfg_scheme_i);
+        std::vector<double> h_C_scheme_i(element_count, 0.0);
+        const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
+        CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+        std::cout << "[SchemeI] bits=34 p=5 pairs=15 backend=cublas (forced)  total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
+        std::cout << "          (B v0; ~1760 MiB HBM; 無 6.0 ms 閘)\n";
+    }
+    {
+        OzakiConfig cfg_scheme_i;
+        cfg_scheme_i.mode = ExecutionMode::SchemeI;
+        cfg_scheme_i.scheme_i_mantissa_bits = 34;
+        cfg_scheme_i.scheme_i_triangular = true;
+        cfg_scheme_i.scheme_i_pair_threshold = 4;
+        cfg_scheme_i.scheme_i_fused = true;
+        AdaptiveOzakiEngine engine_i(cfg_scheme_i);
+        std::vector<double> h_C_scheme_i(element_count, 0.0);
+        const double scheme_i_ms = time_ms(runs, [&]() { engine_i.execute(d_A, d_B, d_C, n, n, n); });
+        CHECK_CUDA(cudaMemcpy(h_C_scheme_i.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+        std::cout << "[SchemeI] bits=34 p=5 pairs=15 backend=fused            total " << scheme_i_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_i) << "\n";
+        std::cout << "          (PR6 fused prototype)\n";
+    }
+    {
+        OzakiConfig cfg_scheme_ii;
+        cfg_scheme_ii.mode = ExecutionMode::SchemeII;
+        cfg_scheme_ii.scheme_ii_num_moduli = 20;
+        AdaptiveOzakiEngine engine_ii(cfg_scheme_ii);
+        std::vector<double> h_C_scheme_ii(element_count, 0.0);
+        const double scheme_ii_ms = time_ms(runs, [&]() { engine_ii.execute(d_A, d_B, d_C, n, n, n); });
+        CHECK_CUDA(cudaMemcpy(h_C_scheme_ii.data(), d_C, element_count * sizeof(double), cudaMemcpyDeviceToHost));
+        std::cout << "[SchemeII] num_moduli=20                             total " << scheme_ii_ms << " ms  err " << max_error(h_C_reference, h_C_scheme_ii) << "\n";
+        std::cout << "          (M3 native 192-bit INT8 CRT Reconstruction)\n";
     }
 
     CHECK_CUBLAS(cublasDestroy(handle_native));

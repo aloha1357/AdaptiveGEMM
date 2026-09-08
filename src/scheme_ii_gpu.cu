@@ -166,14 +166,16 @@ __global__ void crt_reconstruct_kernel(const int32_t* __restrict__ C_mod, double
             v[p_idx] = r;
         }
         
-        for(int p_idx = 0; p_idx < num_moduli - 1; ++p_idx) {
-            int v_ii = v[p_idx];
-            for(int q_idx = p_idx + 1; q_idx < num_moduli; ++q_idx) {
-                int p = primes[q_idx];
-                long long diff = v[q_idx] - v_ii;
-                diff = diff % p;
-                if (diff < 0) diff += p;
-                v[q_idx] = (diff * inv_table[p_idx * 20 + q_idx]) % p;
+        for (int i_idx = 0; i_idx < num_moduli - 1; ++i_idx) {
+            int v_ii = v[i_idx];
+            for (int j_idx = i_idx + 1; j_idx < num_moduli; ++j_idx) {
+                int p = primes[j_idx];
+                int diff = v[j_idx] - v_ii;
+                while (diff < 0) diff += p;
+                uint32_t inv = inv_table[i_idx * 20 + j_idx];
+                uint32_t num = diff * inv;
+                uint32_t magic = (uint32_t)(((1ULL << 32) + p - 1) / p);
+                v[j_idx] = num - __umulhi(num, magic) * p;
             }
         }
         

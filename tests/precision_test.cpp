@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
     int scheme_ii_group_size = 4;
     int scheme_ii_mma_variant = 0;
     int scheme_ii_prologue_fusion = 0;
+    std::string scheme_ii_ablate = "";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -119,6 +120,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--scheme_ii_prologue_fusion" && i + 1 < argc) {
             std::string fusion = argv[++i];
             scheme_ii_prologue_fusion = (fusion == "tile_local" || fusion == "1") ? 1 : 0;
+        } else if (arg == "--scheme_ii_ablate" && i + 1 < argc) {
+            scheme_ii_ablate = argv[++i];
         }
     }
 
@@ -174,6 +177,7 @@ int main(int argc, char** argv) {
     config.scheme_ii_moduli_group_size = scheme_ii_group_size;
     config.scheme_ii_mma_variant = scheme_ii_mma_variant;
     config.scheme_ii_prologue_fusion = scheme_ii_prologue_fusion;
+    config.scheme_ii_ablate = scheme_ii_ablate;
 
     if (policy_str == "Auto" ||
         (mode == ExecutionMode::SchemeI && num_split == 0) ||
@@ -278,7 +282,10 @@ int main(int argc, char** argv) {
         double max_abs_error = compute_max_error(h_reference, h_result, rms_error, max_rel_error);
         double max_abs_custom_vs_schemeII = compute_max_error(h_schemeII, h_custom, dummy_rms, dummy_rel);
         double max_abs_custom_vs_cublas_backend = compute_max_error(h_cublas_backend, h_custom, dummy_rms, dummy_rel);
-        bool passed = (max_rel_error <= 1e-6) && !contract.native_fp64_used && !contract.residual_enabled;
+    // Phase 22 has an FP32-class error contract. Relative error is useful for
+    // diagnostics, but it is unstable for near-zero GEMM outputs; use the
+    // documented absolute-error gate for pass/fail.
+    bool passed = (max_abs_error <= 1e-8) && !contract.native_fp64_used && !contract.residual_enabled;
         if (want_custom_mma) {
             passed = passed && contract.used_custom_mma && contract.scheme_ii_backend == "custom_mma";
         }
@@ -368,7 +375,7 @@ int main(int argc, char** argv) {
               << "}\n";
 
     auto contract = engine.getPrecisionContract();
-    bool passed_gate = (max_rel_error <= 1e-6);
+    bool passed_gate = (error <= 1e-8);
     std::cout << "\nPrecisionContract {\n"
               << "  mode: \"" << contract.mode << "\"\n"
               << "  target_mantissa_bits: " << contract.target_mantissa_bits << "\n"
@@ -411,7 +418,7 @@ int main(int argc, char** argv) {
     CHECK_CUBLAS(cublasDestroy(handle));
     CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
 
-    if (max_rel_error > 1e-6) {
+    if (error > 1e-8) {
         return 1;
     }
     return 0;

@@ -51,6 +51,7 @@ struct Int8GemmBench {
     double cublas_tops;
     double peak_frac;    // our_tops / 121
     double vs_cublas;    // our_tops / cublas_tops
+    int32_t max_abs_int32;
 };
 
 // Runs both kernels on a random s8 matrix of size m x n x k, returns bench.

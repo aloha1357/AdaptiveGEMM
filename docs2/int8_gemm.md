@@ -259,3 +259,49 @@ n=512 vs CPU gold（mantissa=34, p=5）：
 - backend=intree_f64_epilogue: ~22.07 ms (估 1280 MiB；6.0 ms 是量測閘不是保證)
 
 精準度與 B v0 (cuBLAS) bit-exact (n=512, 15/25 pair 誤差皆一致)。
+
+---
+
+## PR4b：SchemeI backend 預設 in-tree；Phase 22 仍是產品 default
+
+**一行變更**：`include/AdaptiveOzaki.h`
+
+```cpp
+// 改前（PR4a 合入時）
+bool scheme_i_use_cublas_int8 = true;  // B v0; flip is PR4b
+
+// 改後（PR4b）
+bool scheme_i_use_cublas_int8 = false; // PR4b: default=intree_f64_epilogue; set true to force cuBLAS INT8 (B v0)
+```
+
+**意義**：`mode==SchemeI` 時，若未顯式設定 `scheme_i_use_cublas_int8 = true`，引擎走 B.1（in-tree f64 epilogue），省去 1760 MiB INT32 scratch，改用約 1280 MiB。
+
+**Phase 22 仍是產品 default**：`OzakiConfig` 的 `mode` 預設仍是 `ExecutionMode::Phase22`，不受此 PR 影響。
+
+**後門**：需要 B v0（cuBLAS INT8）時，設：
+
+```cpp
+config.scheme_i_use_cublas_int8 = true; // force backend=cublas (B v0)
+```
+
+**tests 更新**：`scheme_i_precision_test` 改為先測 b1（預設路徑），再測 v0（regression via `use_cublas=true`）。兩者精準度 bit-exact。
+
+**demo 更新**：`[SchemeI]` 預設列改印 `backend=intree_f64_epilogue`；cublas 列標 `(forced)` 並附說明。
+
+**精準度**（n=512, U(-1,1), mantissa=34）：
+
+| backend | 15 pair err | 25 pair err |
+|---------|------------|------------|
+| b1 (default, intree_f64_epilogue) | ~2e-6 | **≤ 1e-8** |
+| v0 (regression, cublas) | ~2e-6 | **≤ 1e-8** |
+
+25 pair + U(-1,1) ≤ 1e-8：b1 與 v0 一致（bit-exact）。
+## PR2~PR4 �`���GScheme I & INT8 GEMM
+
+| ���� | ���A / �ƾ� |
+|------|------------|
+| PR3 A1 �t�� INT8 TOPS | 22.1 vs 26.4 TOPS (A1 met) |
+| PR2 15 pair err (n=512) | ~2e-6 |
+| PR2 25 pair err (n=512) | ? 1e-8 |
+| PR4a b1 ms (20483) | ~21.4 ms |
+

@@ -26,13 +26,22 @@ endif()
 
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_INCLUDE_DIR)
 
-set(ADAPTIVEGEMM_ROOT "${CMAKE_CURRENT_LIST_DIR}" CACHE PATH "Path to the standalone public release source tree")
+set(ADAPTIVEGEMM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+set(ADAPTIVEGEMM_CUDA_ARCH "sm_89" CACHE STRING "CUDA architecture passed to nvcc")
+
+# The Windows nvcc workaround uses custom commands. Track every local header
+# so edits to Float128/UInt384 and nested kernel includes rebuild CUDA objects.
+file(GLOB_RECURSE ADAPTIVEGEMM_HEADERS CONFIGURE_DEPENDS
+    "${ADAPTIVEGEMM_ROOT}/include/*.h"
+    "${ADAPTIVEGEMM_ROOT}/include/*.cuh"
+    "${ADAPTIVEGEMM_ROOT}/src/*.h"
+    "${ADAPTIVEGEMM_ROOT}/src/*.cuh")
 
 set(ADAPTIVEGEMM_CU "${ADAPTIVEGEMM_ROOT}/src/AdaptiveOzaki.cu")
 set(ADAPTIVEGEMM_OBJ "${CMAKE_CURRENT_BINARY_DIR}/AdaptiveOzaki.cu.obj")
 
 if(MSVC)
-    set(NVCC_EXTRA_FLAGS "-Xcompiler=/MD")
+    set(NVCC_EXTRA_FLAGS "-Xcompiler=/MD$<$<CONFIG:Debug>:d>")
 else()
     set(NVCC_EXTRA_FLAGS "-Xcompiler=-fPIC")
 endif()
@@ -43,7 +52,7 @@ function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
         COMMAND ${NVCC_EXECUTABLE}
             --std=c++17
             -O3
-            -arch=sm_89
+            -arch=${ADAPTIVEGEMM_CUDA_ARCH}
             ${NVCC_EXTRA_FLAGS}
             -I
             ${ADAPTIVEGEMM_ROOT}/include
@@ -55,6 +64,7 @@ function(adaptive_nvcc_cu_obj CU_FILE OBJ_FILE)
             ${OBJ_FILE}
         DEPENDS
             "${CU_FILE}"
+            ${ADAPTIVEGEMM_HEADERS}
             "${ADAPTIVEGEMM_ROOT}/include/AdaptiveOzaki.h"
             "${ADAPTIVEGEMM_ROOT}/include/scheme_i.h"
             "${ADAPTIVEGEMM_ROOT}/include/scheme_ii_fused.h"
@@ -249,8 +259,26 @@ target_link_libraries(adaptive_gemm_fp128_error_128_test PRIVATE adaptive_gemm C
 add_test(NAME fp128_error_128 COMMAND adaptive_gemm_fp128_error_128_test)
 
 add_executable(adaptive_gemm_fp128_ieee_adapter_test tests/fp128_ieee_adapter_test.cpp)
-target_link_libraries(adaptive_gemm_fp128_ieee_adapter_test PRIVATE adaptive_gemm CUDA::cudart)
+target_include_directories(adaptive_gemm_fp128_ieee_adapter_test PRIVATE "${ADAPTIVEGEMM_ROOT}/include")
 add_test(NAME fp128_ieee_adapter COMMAND adaptive_gemm_fp128_ieee_adapter_test)
+set_tests_properties(fp128_ieee_adapter PROPERTIES LABELS "cpu")
+
+# Exercise all 20 CRT entries and a partial output tile (barrier safety).
+add_test(NAME scheme_ii_fused_edge20 COMMAND adaptive_gemm_scheme_ii_fused_compare_test
+    -M 17 -N 19 -K 65 --num_moduli 20 --precision_policy Fixed)
+set_tests_properties(scheme_ii_fused_edge20 PROPERTIES TIMEOUT 60)
+
+# Existing tests use assert; keep their checks active in Release builds too.
+get_property(ADAPTIVEGEMM_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(test_target IN LISTS ADAPTIVEGEMM_TARGETS)
+    if(test_target MATCHES "^adaptive_gemm_.*test$")
+        if(MSVC)
+            target_compile_options(${test_target} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${test_target} PRIVATE -UNDEBUG)
+        endif()
+    endif()
+endforeach()
 if(ADAPTIVEGEMM_BUILD_PYTHON)
     add_test(NAME pytest_binding
         COMMAND ${Python_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pybind.py

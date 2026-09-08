@@ -1,7 +1,8 @@
+#pragma once
+
 #include "scheme_ii_int192.h"
 #include "DoubleDouble.h"
 #include "Float128.h"
-#pragma once
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

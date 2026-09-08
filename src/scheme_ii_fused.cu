@@ -168,6 +168,13 @@ static __global__ void fused_crt_reconstruct_kernel(const int32_t* __restrict__ 
                                                    int m, int n, int m_pad, int n_pad, int num_moduli, int S,
                                                    const int32_t* __restrict__ primes, const int32_t* __restrict__ inv_table,
                                                    Int192 M, Int192 M_half, const Int192* __restrict__ P) {
+    __shared__ uint32_t magic[20];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int p_idx = tid; p_idx < num_moduli; p_idx += blockDim.x * blockDim.y) {
+        magic[p_idx] = (uint32_t)(((1ULL << 32) + primes[p_idx] - 1) / primes[p_idx]);
+    }
+    // Every thread participates, including threads outside the output bounds.
+    __syncthreads();
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < m && j < n) {
@@ -184,10 +191,10 @@ static __global__ void fused_crt_reconstruct_kernel(const int32_t* __restrict__ 
             int v_ii = v[p_idx];
             for (int q_idx = p_idx + 1; q_idx < num_moduli; ++q_idx) {
                 int p = primes[q_idx];
-                long long diff = v[q_idx] - v_ii;
-                diff = diff % p;
-                if (diff < 0) diff += p;
-                v[q_idx] = (int)((diff * inv_table[p_idx * 20 + q_idx]) % p);
+                int diff = v[q_idx] - v_ii;
+                while (diff < 0) diff += p;
+                uint32_t num = diff * inv_table[p_idx * 20 + q_idx];
+                v[q_idx] = num - __umulhi(num, magic[q_idx]) * p;
             }
         }
 
@@ -239,6 +246,39 @@ static void destroy_scheme_ii_graph(AdaptiveOzakiEngine* engine) {
 // Host scalars referenced by captured cuBLAS nodes must outlive the graph.
 static int kFusedAlpha = 1;
 static int kFusedBeta = 0;
+
+// K×N (N-contiguous) → N×K (K-contiguous). One 32×32 tile per CTA, all planes.
+__global__ void scheme_ii_transpose_b_kn_to_nk_kernel(
+    const int8_t* __restrict__ in, int8_t* __restrict__ out,
+    int k_pad, int n_pad) {
+    constexpr int TILE = 32;
+    __shared__ int8_t sm[TILE][TILE + 1];
+    int plane = (int)blockIdx.z;
+    int n0 = (int)blockIdx.x * TILE;
+    int k0 = (int)blockIdx.y * TILE;
+    int tn = (int)threadIdx.x;
+    int tk = (int)threadIdx.y;
+    const int8_t* pin = in + (size_t)plane * (size_t)k_pad * (size_t)n_pad;
+    int8_t* pout = out + (size_t)plane * (size_t)n_pad * (size_t)k_pad;
+
+    int n = n0 + tn;
+    int k = k0 + tk;
+    if (k < k_pad && n < n_pad)
+        sm[tk][tn] = pin[(size_t)k * n_pad + n];
+    __syncthreads();
+
+    int n2 = n0 + tk;
+    int k2 = k0 + tn;
+    if (n2 < n_pad && k2 < k_pad)
+        pout[(size_t)n2 * k_pad + k2] = sm[tn][tk];
+}
+
+static void launch_transpose_b_kn_to_nk(
+    const int8_t* in, int8_t* out, int k_pad, int n_pad, int n_planes, cudaStream_t stream) {
+    dim3 block(32, 32);
+    dim3 grid((n_pad + 31) / 32, (k_pad + 31) / 32, n_planes);
+    scheme_ii_transpose_b_kn_to_nk_kernel<<<grid, block, 0, stream>>>(in, out, k_pad, n_pad);
+}
 
 static bool launch_custom_mma_groups(
     cudaStream_t stream,
@@ -329,12 +369,13 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
                                   int m, int n, int k, int m_pad, int n_pad, int k_pad,
                                   int num_moduli, int S, Int192 M, Int192 M_half,
                                   int32_t* d_primes, int32_t* d_inv_table, Int192* d_P,
-                                  int* d_eA, int* d_eB, int8_t* d_A_mod, int8_t* d_B_mod, int32_t* d_C_mod,
+                                  int* d_eA, int* d_eB, int8_t* d_A_mod, int8_t* d_B_mod, int8_t* d_B_mod_nk,
+                                  int32_t* d_C_mod,
                                   cudaEvent_t* ev, bool profile, bool use_custom_mma,
                                   int group_size, bool use_partial_crt, bool use_true_fused,
                                   const int32_t* h_primes, int* gemm_launches_out,
                                   int mma_variant, bool use_prologue_fusion,
-                                  cudaStream_t stream2, cudaEvent_t ev_b) {
+                                  cudaStream_t stream2, cudaEvent_t ev_b, bool skip_crt) {
     dim3 block2d(16, 16);
     cudaStream_t streamB = (stream2 && stream2 != stream) ? stream2 : stream;
     if (profile) cudaEventRecord(ev[0], stream);
@@ -391,12 +432,17 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     if (use_custom_mma) {
         int gsz = group_size < 1 ? 1 : group_size;
         if (gsz > 4) gsz = 4;
+        int8_t* B_mma = d_B_mod;
+        if (!skip_global_quantize && d_B_mod_nk) {
+            launch_transpose_b_kn_to_nk(d_B_mod, d_B_mod_nk, k_pad, n_pad, num_moduli, stream);
+            B_mma = d_B_mod_nk;
+        }
         bool ok = skip_global_quantize
             ? launch_prologue_mma_groups(stream, d_A, d_B, d_C_mod, d_eA, d_eB,
                                          m, n, k, m_pad, n_pad, k_pad, num_moduli, gsz, S,
                                          d_primes, mma_variant, &launches)
             : launch_custom_mma_groups(stream, m_pad, n_pad, k_pad, num_moduli, gsz,
-                                       d_A_mod, d_B_mod, d_C_mod, d_primes, d_inv_table,
+                                       d_A_mod, B_mma, d_C_mod, d_primes, d_inv_table,
                                        use_partial_crt, &launches, mma_variant);
         if (!ok) return false;
     } else {
@@ -420,7 +466,9 @@ static bool launch_fused_pipeline(cublasHandle_t handle, cudaStream_t stream,
     if (gemm_launches_out) *gemm_launches_out = launches;
     if (profile) cudaEventRecord(ev[5], stream);
 
-    if (use_partial_crt) {
+    if (skip_crt) {
+        // Ablation mode: do not perform final CRT steps.
+    } else if (use_partial_crt) {
         int gsz = group_size < 1 ? 1 : group_size;
         if (gsz > 4) gsz = 4;
         uint32_t h_Mg[20] = {};
@@ -484,7 +532,8 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
         return;
     }
 
-    if (!engine->d_scheme_ii_A_mod || !engine->d_scheme_ii_B_mod || !engine->d_scheme_ii_C_mod ||
+    if (!engine->d_scheme_ii_A_mod || !engine->d_scheme_ii_B_mod || !engine->d_scheme_ii_B_mod_nk ||
+        !engine->d_scheme_ii_C_mod ||
         !engine->d_scheme_ii_eA || !engine->d_scheme_ii_eB || !engine->d_scheme_ii_primes ||
         !engine->d_scheme_ii_inv_table || !engine->d_scheme_ii_P) {
         contract.failure_reason = "SchemeII_Fused workspace is not allocated";
@@ -494,13 +543,25 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     int group_size = config.scheme_ii_moduli_group_size;
     bool use_true_fused = false;
     bool use_partial_crt = false;
-    if (use_custom_mma && config.scheme_ii_use_true_fused_kernel) {
+    bool skip_crt = false;
+
+    if (config.scheme_ii_ablate == "mma_only") {
+        use_partial_crt = false;
+        group_size = 1;
+        skip_crt = true;
+    } else if (config.scheme_ii_ablate == "mma_mod_only") {
+        use_partial_crt = true;
+        group_size = 1;
+        skip_crt = true;
+    } else if (config.scheme_ii_ablate == "mma_partial_crt") {
+        use_partial_crt = true;
+        skip_crt = true;
+        if (group_size < 2) group_size = 4;
+    } else if (use_custom_mma && config.scheme_ii_use_true_fused_kernel) {
         if (group_size <= 0 || group_size >= num_moduli) {
-            // M8.4 all-moduli true fused control path.
             use_true_fused = true;
             group_size = num_moduli;
         } else {
-            // M8.3/M9 experimental speed path: grouped MMA + partial CRT.
             use_partial_crt = true;
             if (group_size < 2) group_size = 2;
             if (group_size > 4) group_size = 4;
@@ -511,6 +572,7 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     } else {
         group_size = 1;
     }
+
     const int mma_variant = config.scheme_ii_mma_variant;
     const bool use_prologue_fusion = use_partial_crt && (config.scheme_ii_prologue_fusion == 1);
 
@@ -604,10 +666,10 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
             if (cap_st == cudaSuccess) {
                 launch_fused_pipeline(handle, stream, d_A, d_B, d_C, m, n, k, m_pad, n_pad, k_pad,
                                       num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
-                                      d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, nullptr, false,
+                                      d_eA, d_eB, d_A_mod, d_B_mod, engine->d_scheme_ii_B_mod_nk, d_C_mod, nullptr, false,
                                       use_custom_mma, group_size, use_partial_crt, use_true_fused,
                                       h_primes, &gemm_launches, mma_variant, use_prologue_fusion,
-                                      nullptr, nullptr);
+                                      nullptr, nullptr, skip_crt);
                 cudaGraph_t graph = nullptr;
                 cap_st = cudaStreamEndCapture(stream, &graph);
                 if (cap_st == cudaSuccess && graph) {
@@ -650,10 +712,10 @@ void execute_scheme_ii_fused(cublasHandle_t handle, const double* d_A, const dou
     if (!used_graph) {
         pipeline_ok = launch_fused_pipeline(handle, stream, d_A, d_B, d_C, m, n, k, m_pad, n_pad, k_pad,
                                             num_moduli, S, M, M_half, d_primes, d_inv_table, d_P,
-                                            d_eA, d_eB, d_A_mod, d_B_mod, d_C_mod, ev, profile,
+                                            d_eA, d_eB, d_A_mod, d_B_mod, engine->d_scheme_ii_B_mod_nk, d_C_mod, ev, profile,
                                             use_custom_mma, group_size, use_partial_crt, use_true_fused,
                                             h_primes, &gemm_launches, mma_variant, use_prologue_fusion,
-                                            stream2, engine->d_scheme_ii_ev_b);
+                                            stream2, engine->d_scheme_ii_ev_b, skip_crt);
     }
 
     if (profile) {

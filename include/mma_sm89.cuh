@@ -101,3 +101,50 @@ __device__ __forceinline__ void ldmatrix_x4_trans(
         : "r"(addr)
     );
 }
+
+// Path B: ldmatrix.x4.trans on K-major sB[K][N] (16B along N) produces 2N×2K
+// packing. MMA m16n8k32.s8 .col wants 1N×4K. Locked against scatter ldmatrix.x2
+// gold (scripts/path_b_probe.cu): shfl inside 4-lane groups + __byte_perm 0x6420/0x7531.
+// t0..t3 = x4.trans of 32K × 16N. Emits two n8 B fragments for this lane.
+__device__ __forceinline__ void repack_x4_trans_to_mma_b(
+    uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3,
+    uint32_t& j_r0, uint32_t& j_r1, uint32_t& j1_r0, uint32_t& j1_r1) {
+    int lane = threadIdx.x & 31;
+    int q = lane & 3;
+    int n8 = lane >> 2;
+    int src0 = (n8 & ~1) * 2 + ((q & 1) ? 2 : 0);
+    int src1 = src0 + 1;
+    int sel = (n8 & 1) ? 0x7531 : 0x6420;
+
+    uint32_t a0 = __shfl_sync(0xffffffff, t0, src0);
+    uint32_t b0 = __shfl_sync(0xffffffff, t0, src1);
+    uint32_t a1 = __shfl_sync(0xffffffff, t1, src0);
+    uint32_t b1 = __shfl_sync(0xffffffff, t1, src1);
+    uint32_t a2 = __shfl_sync(0xffffffff, t2, src0);
+    uint32_t b2 = __shfl_sync(0xffffffff, t2, src1);
+    uint32_t a3 = __shfl_sync(0xffffffff, t3, src0);
+    uint32_t b3 = __shfl_sync(0xffffffff, t3, src1);
+    if (q < 2) {
+        j_r0 = __byte_perm(a0, b0, sel);
+        j_r1 = __byte_perm(a2, b2, sel);
+    } else {
+        j_r0 = __byte_perm(a1, b1, sel);
+        j_r1 = __byte_perm(a3, b3, sel);
+    }
+
+    a0 = __shfl_sync(0xffffffff, t0, src0 + 16);
+    b0 = __shfl_sync(0xffffffff, t0, src1 + 16);
+    a1 = __shfl_sync(0xffffffff, t1, src0 + 16);
+    b1 = __shfl_sync(0xffffffff, t1, src1 + 16);
+    a2 = __shfl_sync(0xffffffff, t2, src0 + 16);
+    b2 = __shfl_sync(0xffffffff, t2, src1 + 16);
+    a3 = __shfl_sync(0xffffffff, t3, src0 + 16);
+    b3 = __shfl_sync(0xffffffff, t3, src1 + 16);
+    if (q < 2) {
+        j1_r0 = __byte_perm(a0, b0, sel);
+        j1_r1 = __byte_perm(a2, b2, sel);
+    } else {
+        j1_r0 = __byte_perm(a1, b1, sel);
+        j1_r1 = __byte_perm(a3, b3, sel);
+    }
+}

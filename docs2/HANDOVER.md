@@ -70,7 +70,7 @@ iThome Day 8～10 怎麼切，在 `D:\D_backup\2025\tum\26w\Ithome\cASE\Blog\blu
 1. ~~smem XOR swizzle~~ 10.9 → 10.3 ms。
 2. ~~質數 k=0 prefetch~~ 試過，CRT 變慢，已撤回。
 3. ~~公平賽 mantissa~~ 已跑。34-bit cuBLAS 3.97 ms / 7.6e-10，Phase 22 約 11 ms / 3.4e-9，**同一精度預算輸 2.8×**。
-4. **下一步：8-bit Scheme I**（slice 乘積塞進 int32，不要每片跑 7 質數 CRT）。繼續微調現在這顆 kernel 追不回這 2.8×。
+4. **下一步：B.1/fused（把 INT32 scratch 砍掉）**。不要再微調這顆 CRT kernel 追那 2.8×。
 
 成功標準：誤差維持 `~3e-9` / `1e-8` 以內；wall time 往 8.5 ms 靠近。不保證贏預設 emu。
 

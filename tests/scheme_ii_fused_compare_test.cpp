@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     int group_size = 4;
     int mma_variant = 0;
     int prologue_fusion = 0;
+    std::string ablate_str = "";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -43,6 +44,9 @@ int main(int argc, char** argv) {
         else if (arg == "--scheme_ii_prologue_fusion" && i + 1 < argc) {
             std::string fusion = argv[++i];
             prologue_fusion = (fusion == "tile_local" || fusion == "1") ? 1 : 0;
+        }
+        else if (arg == "--scheme_ii_ablate" && i + 1 < argc) {
+            ablate_str = argv[++i];
         }
     }
 
@@ -82,6 +86,7 @@ int main(int argc, char** argv) {
         config.scheme_ii_moduli_group_size = group_size;
         config.scheme_ii_mma_variant = mma_variant;
         config.scheme_ii_prologue_fusion = prologue_fusion;
+        config.scheme_ii_ablate = ablate_str;
         if (policy_str == "Auto" || num_moduli <= 0) {
             config.precision_policy = ozaki::PrecisionPolicy::Auto;
         } else {

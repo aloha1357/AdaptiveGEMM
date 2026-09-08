@@ -9,11 +9,16 @@
 Consumer Ada GPUs throttle native FP64. AdaptiveGEMM maps a 2-slice Ozaki +
 7-prime CRT GEMM onto INT8 Tensor Cores. On an RTX 4060 Laptop it is **faster
 than native `cublasDgemm`**, and **slower and less accurate than cuBLAS 13
-FP64 emulation**.
+FP64 emulation**. The speedup over native DGEMM is a reduced-precision
+tradeoff, not an equivalent FP64 replacement.
 
-This is not full FP64. Default Phase 22 keeps max error vs native DGEMM around
-`3e-9` on 2048³ `U(-1,1)` inputs — better than FP32, not a drop-in for
-`cublasDgemm` ulp.
+**Precision contract:** this library accepts FP64 inputs and writes FP64
+outputs, but the default INT8 CRT path does **not** provide FP64-precision
+semantics. Default Phase 22 is an experimental ~34-bit mantissa path. On
+2048³ `U(-1,1)` inputs it keeps max error around `3e-9`, which is better than
+plain FP32 on this benchmark but still far from native DGEMM / cuBLAS emu ulp.
+Treat it as FP32-class / FP32-plus accuracy for bounded, well-conditioned
+inputs, not as a drop-in FP64 GEMM.
 
 **English** | [**中文**](#中文版)
 
@@ -50,6 +55,8 @@ Measured 2026-08 on **RTX 4060 Laptop (Ada, SM 8.9, CUDA 13.0)**, 2048³,
 | cuBLAS native DGEMM | 82.2 ms | 209 GFLOPS | 1.0× | — |
 | **AdaptiveGEMM Phase 22 (INT8 CRT)** | **13.6 ms** | **1262 GFLOPS** | **6.0×** | **3.40e-9** |
 | cuBLAS 13 Ozaki emu (`COMPUTE_64F_EMULATED_FIXEDPOINT`) | 8.5 ms | 2014 GFLOPS | 9.6× | 2.84e-13 |
+| AdaptiveGEMM Scheme I (2048³ err≤1e-8, backend=intree_f64_epilogue) | ~22.1 ms | ~777 GFLOPS | ~3.7× | ≤1e-8 |
+| 孤立 INT8 GEMM vs cublasGemmEx INT8 | — | 22.3 vs ~24.5 TOPS | A1 met | — |
 | Old Phase 24 ExtremeMix (default before this fix) | ~130 ms | ~132 GFLOPS | 0.6× | 3.55e-15 |
 
 Phase 22 vs cuBLAS emu: **about 1.6× slower**, error worse by ~4 orders of
@@ -79,6 +86,13 @@ Phase 22 uses a **17-bit high + 17-bit low** split (about 34 mantissa bits)
 and 7 primes `{127, 113, 109, 107, 103, 101, 97}`. That is why the error sits
 near `1e-9`, not `1e-15`.
 
+Do not read "FP64 input/output" as "FP64 precision supported". The current
+fast paths deliberately omit the extra slices, dynamic mantissa control,
+correction terms, and residual handling needed to approach true FP64 accuracy.
+The only paths in this repository that can show `1e-15`-level numbers do so by
+adding native FP64 residual/recompute work; they are not pure INT8 Tensor Core
+Ozaki/CRT paths and are slower.
+
 | Matrix | Max abs error vs native FP64 | Notes |
 |--------|------------------------------|-------|
 | 512² | 1.5e-9 | `precision_test` (tolerance 1e-8) |
@@ -91,6 +105,15 @@ does not.
 
 Ill-conditioned inputs or values spanning many orders of magnitude need more
 slices (and will cost more CRT passes).
+
+### Precision support matrix
+
+| Mode | FP64 input/output | Practical precision support | Why |
+|------|-------------------|-----------------------------|-----|
+| Phase 22 INT8 CRT | Yes | FP32-class / ~34-bit experimental, benchmark max error ~`3e-9` | Omits the extra slices and correction needed for FP64 ulp |
+| Scheme I prototype | Yes | FP32-class target, currently `≤1e-8` on 2048³ target cases | Correctness-first path; slower and not FP64 precision |
+| Phase 24 / residual variants | Yes | Can look FP64-like | Adds native FP64 residual/recompute work, so it is not the pure INT8 fast path |
+| cuBLAS 13 FP64 emu | Yes | Much closer to FP64 (`~1e-13` here) | NVIDIA production emulation with dynamic mantissa/control |
 
 ---
 
@@ -205,6 +228,10 @@ nvcc --std=c++17 -O3 -arch=sm_89 -I include examples/demo_main.cpp src/AdaptiveO
 - **Loses to cuBLAS 13 Ozaki emulation** on Ada in both speed and accuracy.
   If you only need a fast FP64 GEMM on CUDA 13, call cuBLAS.
 - Default Phase 22 is ~34-bit Ozaki, max error ~`1e-9` on `U(-1,1)` 2048³.
+  This is not FP64 precision support; it is an FP64 I/O path with
+  FP32-class/FP32-plus practical accuracy on the measured distribution.
+- Scheme I is currently correctness-first and reaches only `1e-8`-class
+  target accuracy in the documented path; do not market it as FP64.
 - Phase 23–26 (hetero / residual / hybrid) still contain naive FP64 paths.
   They can look “more accurate” because they recompute in FP64, and they are
   slower than native DGEMM.
@@ -241,10 +268,14 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 消費級 Ada 的 native FP64 被限速。AdaptiveGEMM 把 2-slice Ozaki + 7 質數 CRT
 GEMM 丟上 INT8 Tensor Core。在 RTX 4060 Laptop 上它 **比 native `cublasDgemm`
-快**，也 **比 cuBLAS 13 的 FP64 emulation 慢、比較不准**。
+快**，也 **比 cuBLAS 13 的 FP64 emulation 慢、比較不准**。這個 speedup 是降精度
+換來的 tradeoff，不是等價 FP64 替代品。
 
-預設 Phase 22 不是滿 FP64。2048³、`U(-1,1)` 對 native DGEMM 的 max error 大約
-`3e-9`：比 FP32 好，不能拿去冒充 `cublasDgemm` 的 ulp。
+**精度契約先講清楚：** 這個 repo 可以吃 FP64 input、寫 FP64 output，但預設 INT8
+CRT 路徑不提供 FP64 precision 語義。Phase 22 是大約 34-bit mantissa 的實驗路徑；
+2048³、`U(-1,1)` 對 native DGEMM 的 max error 大約 `3e-9`，在這組 benchmark 上比
+普通 FP32 好，但離 native DGEMM / cuBLAS emu 的 ulp 還很遠。請把它當成有界輸入下
+的 FP32-class / FP32-plus 精度，不要當成可替代 `cublasDgemm` 的 FP64 GEMM。
 
 ## 為什麼要做這個
 
@@ -262,6 +293,8 @@ CUDA 13 的 cuBLAS 已經把量產版做進去了
 | cuBLAS native DGEMM | 82.2 ms | 209 | 1.0× | — |
 | AdaptiveGEMM Phase 22 | 13.6 ms | 1262 | 6.0× | 3.40e-9 |
 | cuBLAS 13 Ozaki emu | 8.5 ms | 2014 | 9.6× | 2.84e-13 |
+| AdaptiveGEMM Scheme I (2048³ err≤1e-8, backend=intree_f64_epilogue) | ~22.1 ms | ~777 | ~3.7× | ≤1e-8 |
+| 孤立 INT8 GEMM vs cublasGemmEx INT8 | — | 22.3 vs ~24.5 TOPS | A1 met | — |
 | 舊 Phase 24 ExtremeMix | ~130 ms | ~132 | 0.6× | 3.55e-15 |
 
 結論：**贏 native，輸 cuBLAS emu（大約慢 1.6×，誤差差四個數量級）。**
@@ -278,6 +311,11 @@ end-to-end GEMM，不能當標題數字。
 Phase 22 是 17-bit high + 17-bit low（大約 34 mantissa bits）加上 7 個質數。
 所以誤差會停在 `1e-9` 附近，不是 `1e-15`。
 
+不要把「FP64 input/output」解讀成「支援 FP64 精度」。目前 fast path 省略了要逼近
+真正 FP64 所需的更多 slices、dynamic mantissa control、修正項與 residual 處理。
+repo 裡能跑出 `1e-15` 級數字的路徑，是因為額外補了 native FP64 residual / recompute；
+那不是純 INT8 Tensor Core Ozaki/CRT 路徑，而且比較慢。
+
 | 規模 | max abs error vs native FP64 |
 |------|------------------------------|
 | 512² | 1.5e-9 |
@@ -285,6 +323,15 @@ Phase 22 是 17-bit high + 17-bit low（大約 34 mantissa bits）加上 7 個�
 | 2048³ cuBLAS emu | 2.84e-13 |
 
 `O(10^-9)` **不是** lossless double。要更接近 FP64 需要加 slice，CRT pass 會變多。
+
+### 精度支援矩陣
+
+| 模式 | FP64 input/output | 實際可宣稱精度 | 原因 |
+|---|---|---|---|
+| Phase 22 INT8 CRT | 有 | FP32-class / 約 34-bit 實驗路徑，實測 max error 約 `3e-9` | 省略逼近 FP64 ulp 需要的額外 slice 與修正 |
+| Scheme I prototype | 有 | FP32-class 目標，目前文件路徑是 `≤1e-8` | 正確性優先，速度也還沒到位，不是 FP64 精度 |
+| Phase 24 / residual variants | 有 | 可以看起來接近 FP64 | 因為補了 native FP64 residual / recompute，不是純 INT8 fast path |
+| cuBLAS 13 FP64 emu | 有 | 明顯更接近 FP64（這裡約 `1e-13`） | NVIDIA 量產 emulation，有 dynamic mantissa/control |
 
 ## 怎麼用
 
@@ -321,6 +368,32 @@ engine = adaptive_gemm_py.AdaptiveGEMM(mode="phase22")
 C = engine.gemm(A, B)
 ```
 
+### FP128 / IEEE binary128 adapter
+
+`Float128` stores a 113-bit significand and supports conversion to and from
+IEEE binary128 bit pairs, including signed zero, subnormals, infinity, and
+NaN payloads. The FP128 GEMM path uses host-side UInt384 CRT reconstruction;
+it accepts finite values only and is a correctness path, not a performance
+claim. Auto policy selects enough of the 49-prime table for the requested K
+(32 primes for the documented 128³ case). A fixed configuration that does not
+have enough CRT capacity fails with `Insufficient CRT bits for FP128`.
+
+```cpp
+#include "AdaptiveOzaki.h"
+
+ozaki::OzakiConfig config;
+config.mode = ozaki::ExecutionMode::SchemeII;
+config.precision_policy = ozaki::PrecisionPolicy::Auto;
+ozaki::AdaptiveOzakiEngine engine(config);
+engine.execute(d_fp128_A, d_fp128_B, d_fp128_C, m, n, k);
+```
+
+Run the adapter and FP128 checks with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -TestRegex "fp128_|dd_gemm"
+```
+
 ### 編譯 demo
 
 ```bash
@@ -336,9 +409,30 @@ nvcc --std=c++17 -O3 -arch=sm_89 -I include examples/demo_main.cpp src/AdaptiveO
 ./adaptive_gemm_demo.exe
 ```
 
+On Windows, the maintained entry point is `scripts/build.ps1`. It discovers
+the installed Visual Studio toolchain, Windows SDK, and `CUDA_PATH`; no
+machine-specific source path is required. Use `-Python` to enable the optional
+pybind11 module and `-SkipTests` when only a build is needed.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` has two jobs. The CUDA 12.6 container builds every
+CMake target with Python bindings enabled and runs the CPU IEEE adapter test.
+The self-hosted Linux GPU job builds the same tree and runs the complete CTest
+suite. The workflow is intentionally a validation definition; it does not
+claim that the container job has a GPU.
+
+The repository includes NCU summary screenshots at
+[`docs/profile_sol.png`](docs/profile_sol.png) and
+[`docs/profile_pipe.png`](docs/profile_pipe.png). They document the measured
+Phase 22 kernel profile; they are not a substitute for rerunning NCU on a
+different driver or GPU.
+
 ## 限制
 
 - Ada 上速度跟精度都輸給 cuBLAS 13 Ozaki emu。只想要快的 FP64 GEMM，直接呼叫 cuBLAS。
+- Phase 22 不是 FP64 precision support；它是 FP64 I/O、約 34-bit 的 INT8 CRT 實驗路徑。
+- Scheme I 目前也只是 `1e-8` 級的 correctness-first path，不能宣稱支援 FP64 精度。
 - Phase 23–26 還留著 naive FP64 / residual 路徑，看起來更準是因為重算，整體會比 native 慢。
 - `analyzeMatrix()` 仍是 stub。
 
