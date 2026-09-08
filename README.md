@@ -416,11 +416,39 @@ pybind11 module and `-SkipTests` when only a build is needed.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` has two jobs. The CUDA 12.6 container builds every
+`.github/workflows/ci.yml` has two jobs. The CUDA 13.0 container builds every
 CMake target with Python bindings enabled and runs the CPU IEEE adapter test.
 The self-hosted Linux GPU job builds the same tree and runs the complete CTest
 suite. The workflow is intentionally a validation definition; it does not
 claim that the container job has a GPU.
+
+### Start the self-hosted WSL GPU runner
+
+The GPU job uses `runs-on: [self-hosted, linux, gpu]`. Opening WSL alone does
+not register a runner; register it once from the repository's **Settings →
+Actions → Runners → New self-hosted runner** page, then keep the runner
+process running:
+
+```bash
+# Ubuntu WSL2, as a non-root user
+mkdir -p ~/actions-runner-adaptivegemm
+cd ~/actions-runner-adaptivegemm
+curl -L -o actions-runner.tar.gz \
+  https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
+tar xzf actions-runner.tar.gz
+./config.sh --url https://github.com/aloha1357/AdaptiveGEMM \
+  --token <one-time-token> --name <runner-name> --labels gpu --work _work
+
+# WSL's driver library must precede Linux CUDA driver stubs.
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+./run.sh
+```
+
+Verify that the runner shows **online** in GitHub before pushing a change.
+The runner needs CUDA device access (`nvidia-smi -L`) and must not be started
+as root. Stop it with `Ctrl+C`; start it again after reopening WSL. A successful
+GPU run reports `100% tests passed` and includes `fp128_gemm`,
+`fp128_error_128`, and `fp128_ieee_adapter`.
 
 The repository includes NCU summary screenshots at
 [`docs/profile_sol.png`](docs/profile_sol.png) and
