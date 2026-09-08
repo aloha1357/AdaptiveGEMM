@@ -104,7 +104,11 @@ int main() {
     CHECK_CUDA(cudaMemset(d_C, 0, element_count * sizeof(double)));
 
     // Do not let an inherited env var silently turn native DGEMM into emulation.
+#ifdef _WIN32
     _putenv("CUBLAS_EMULATE_DOUBLE_PRECISION=");
+#else
+    unsetenv("CUBLAS_EMULATE_DOUBLE_PRECISION");
+#endif
 
     cublasHandle_t handle_native;
     cublasHandle_t handle_emu;
